@@ -15,7 +15,7 @@ from mlflow.exceptions import MlflowException
 from mlflow.utils.annotations import developer_stable
 
 
-def run_local(target, name, model_uri, flavor=None, config=None):  # pylint: disable=unused-argument
+def run_local(target, name, model_uri, flavor=None, config=None):
     """Deploys the specified model locally, for testing. This function should be defined
     within the plugin module. Also note that this function has a signature which is very
     similar to :py:meth:`BaseDeploymentClient.create_deployment` since both does logically
@@ -225,9 +225,21 @@ class BaseDeploymentClient(abc.ABC):
         """
         pass
 
-    def explain(
-        self, deployment_name=None, df=None, endpoint=None
-    ):  # pylint: disable=unused-argument
+    def predict_stream(self, deployment_name=None, inputs=None, endpoint=None):
+        """
+        Submit a query to a configured provider endpoint, and get streaming response
+
+        Args:
+            deployment_name: Name of deployment to predict against.
+            inputs: The inputs to the query, as a dictionary.
+            endpoint: The name of the endpoint to query.
+
+        Returns:
+            An iterator of dictionary containing the response from the endpoint.
+        """
+        raise NotImplementedError()
+
+    def explain(self, deployment_name=None, df=None, endpoint=None):
         """
         Generate explanations of model predictions on the specified input pandas Dataframe
         ``df`` for the deployed model. Explanation output formats vary by deployment target,

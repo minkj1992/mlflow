@@ -8,9 +8,11 @@ import json
 import logging
 import os
 import posixpath
+import re
 import sys
 import tempfile
 import urllib
+import uuid
 import warnings
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union
 
@@ -37,6 +39,7 @@ from mlflow.tracking._model_registry.client import ModelRegistryClient
 from mlflow.tracking._tracking_service import utils
 from mlflow.tracking._tracking_service.client import TrackingServiceClient
 from mlflow.tracking.artifact_utils import _upload_artifacts_to_databricks
+from mlflow.tracking.multimedia import Image, compress_image_size, convert_to_pil_image
 from mlflow.tracking.registry import UnsupportedModelRegistryStoreURIException
 from mlflow.utils.annotations import deprecated, experimental
 from mlflow.utils.async_logging.run_operations import RunOperations
@@ -44,8 +47,10 @@ from mlflow.utils.databricks_utils import get_databricks_run_url
 from mlflow.utils.logging_utils import eprint
 from mlflow.utils.mlflow_tags import (
     MLFLOW_LOGGED_ARTIFACTS,
+    MLFLOW_LOGGED_IMAGES,
     MLFLOW_PARENT_RUN_ID,
 )
+from mlflow.utils.time import get_current_time_millis
 from mlflow.utils.uri import is_databricks_unity_catalog_uri, is_databricks_uri
 from mlflow.utils.validation import (
     _validate_model_alias_name,
@@ -195,7 +200,8 @@ class MlflowClient:
             A single :py:class:`mlflow.entities.Run` object, if the parent run exists. Otherwise,
             returns None.
 
-        .. testcode:: python
+        .. code-block:: python
+            :test:
             :caption: Example
 
             import mlflow
@@ -1129,7 +1135,6 @@ class MlflowClient:
             run_id, metrics, params, tags, synchronous=synchronous
         )
 
-    @experimental
     def log_inputs(
         self,
         run_id: str,
@@ -1157,11 +1162,10 @@ class MlflowClient:
         .. code-block:: python
             :caption: Example
 
-            from mlflow import MlflowClient
+            import tempfile
+            from pathlib import Path
 
-            features = "rooms, zipcode, median_price, school_rating, transport"
-            with open("features.txt", "w") as f:
-                f.write(features)
+            from mlflow import MlflowClient
 
             # Create a run under the default experiment (whose id is '0').
             client = MlflowClient()
@@ -1169,7 +1173,11 @@ class MlflowClient:
             run = client.create_run(experiment_id)
 
             # log and fetch the artifact
-            client.log_artifact(run.info.run_id, "features.txt")
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                path = Path(tmp_dir, "features.txt")
+                path.write_text(features)
+                client.log_artifact(run.info.run_id, path)
+
             artifacts = client.list_artifacts(run.info.run_id)
             for artifact in artifacts:
                 print(f"artifact: {artifact.path}")
@@ -1197,26 +1205,27 @@ class MlflowClient:
         .. code-block:: python
             :caption: Example
 
-            import os
             import json
+            import tempfile
+            from pathlib import Path
 
             # Create some artifacts data to preserve
             features = "rooms, zipcode, median_price, school_rating, transport"
             data = {"state": "TX", "Available": 25, "Type": "Detached"}
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                tmp_dir = Path(tmp_dir)
+                with (tmp_dir / "data.json").open("w") as f:
+                    json.dump(data, f, indent=2)
+                with (tmp_dir / "features.json").open("w") as f:
+                    f.write(features)
 
-            # Create couple of artifact files under the local directory "data"
-            os.makedirs("data", exist_ok=True)
-            with open("data/data.json", "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-            with open("data/features.txt", "w") as f:
-                f.write(features)
+                # Create a run under the default experiment (whose id is '0'), and log
+                # all files in "data" to root artifact_uri/states
+                client = MlflowClient()
+                experiment_id = "0"
+                run = client.create_run(experiment_id)
+                client.log_artifacts(run.info.run_id, tmp_dir, artifact_path="states")
 
-            # Create a run under the default experiment (whose id is '0'), and log
-            # all files in "data" to root artifact_uri/states
-            client = MlflowClient()
-            experiment_id = "0"
-            run = client.create_run(experiment_id)
-            client.log_artifacts(run.info.run_id, "data", artifact_path="states")
             artifacts = client.list_artifacts(run.info.run_id)
             for artifact in artifacts:
                 print(f"artifact: {artifact.path}")
@@ -1414,31 +1423,54 @@ class MlflowClient:
                 raise TypeError(f"Unsupported figure object type: '{type(figure)}'")
 
     def log_image(
-        self, run_id: str, image: Union["numpy.ndarray", "PIL.Image.Image"], artifact_file: str
+        self,
+        run_id: str,
+        image: Union["numpy.ndarray", "PIL.Image.Image", "mlflow.Image"],
+        artifact_file: Optional[str] = None,
+        key: Optional[str] = None,
+        step: Optional[int] = None,
+        timestamp: Optional[int] = None,
     ) -> None:
-        """Log an image as an artifact. The following image objects are supported:
+        """
+        Logs an image in MLflow, supporting two use cases:
 
-        - `numpy.ndarray`_
-        - `PIL.Image.Image`_
+        1. Time-stepped image logging:
+            Ideal for tracking changes or progressions through iterative processes (e.g.,
+            during model training phases).
 
-        .. _numpy.ndarray:
-            https://numpy.org/doc/stable/reference/generated/numpy.ndarray.html
+            - Usage: :code:`log_image(image, key=key, step=step, timestamp=timestamp)`
 
-        .. _PIL.Image.Image:
-            https://pillow.readthedocs.io/en/stable/reference/Image.html#PIL.Image.Image
+        2. Artifact file image logging:
+            Best suited for static image logging where the image is saved directly as a file
+            artifact.
+
+            - Usage: :code:`log_image(image, artifact_file)`
+
+        The following image formats are supported:
+            - `numpy.ndarray`_
+            - `PIL.Image.Image`_
+
+            .. _numpy.ndarray:
+                https://numpy.org/doc/stable/reference/generated/numpy.ndarray.html
+
+            .. _PIL.Image.Image:
+                https://pillow.readthedocs.io/en/stable/reference/Image.html#PIL.Image.Image
+
+            - :class:`mlflow.Image`: An MLflow wrapper around PIL image for convenient image
+              logging.
 
         Numpy array support
-            - data type (( ) represents a valid value range):
+            - data types:
 
-                - bool
-                - integer (0 ~ 255)
-                - unsigned integer (0 ~ 255)
-                - float (0.0 ~ 1.0)
+                - bool (useful for logging image masks)
+                - integer [0, 255]
+                - unsigned integer [0, 255]
+                - float [0.0, 1.0]
 
                 .. warning::
 
-                    - Out-of-range integer values will be **clipped** to [0, 255].
-                    - Out-of-range float values will be **clipped** to [0, 1].
+                    - Out-of-range integer values will raise ValueError.
+                    - Out-of-range float values will raise ValueError.
 
             - shape (H: height, W: width):
 
@@ -1448,112 +1480,158 @@ class MlflowClient:
                 - H x W x 4 (an RGBA channel order is assumed)
 
         Args:
-            run_id: String ID of the run.
-            image: Image to log.
-            artifact_file: The run-relative artifact file path in posixpath format to which
-                the image is saved (e.g. "dir/image.png").
+            run_id: String ID of run.
+            image: The image object to be logged.
+            artifact_file: Specifies the path, in POSIX format, where the image
+                will be stored as an artifact relative to the run's root directory (for
+                example, "dir/image.png"). This parameter is kept for backward compatibility
+                and should not be used together with `key`, `step`, or `timestamp`.
+            key: Image name for time-stepped image logging. This string may only contain
+                alphanumerics, underscores (_), dashes (-), periods (.), spaces ( ), and
+                slashes (/).
+            step: Integer training step (iteration) at which the image was saved.
+                Defaults to 0.
+            timestamp: Time when this image was saved. Defaults to the current system time.
 
         .. code-block:: python
-            :caption: Numpy Example
+            :caption: Time-stepped image logging numpy example
 
             import mlflow
             import numpy as np
 
             image = np.random.randint(0, 256, size=(100, 100, 3), dtype=np.uint8)
-
-            run = client.create_run(experiment_id="0")
-            client.log_image(run.info.run_id, image, "image.png")
+            with mlflow.start_run() as run:
+                client = mlflow.MlflowClient()
+                client.log_image(run.info.run_id, image, key="dogs", step=3)
 
         .. code-block:: python
-            :caption: Pillow Example
+            :caption: Time-stepped image logging pillow example
 
             import mlflow
             from PIL import Image
 
             image = Image.new("RGB", (100, 100))
+            with mlflow.start_run() as run:
+                client = mlflow.MlflowClient()
+                client.log_image(run.info.run_id, image, key="dogs", step=3)
 
-            run = client.create_run(experiment_id="0")
-            client.log_image(run.info.run_id, image, "image.png")
-        """
+        .. code-block:: python
+            :caption: Time-stepped image logging with mlflow.Image example
 
-        def _is_pillow_image(image):
-            from PIL.Image import Image
+            import mlflow
+            from PIL import Image
 
-            return isinstance(image, Image)
+            # Saving an image to retrieve later.
+            Image.new("RGB", (100, 100)).save("image.png")
 
-        def _is_numpy_array(image):
+            image = mlflow.Image("image.png")
+            with mlflow.start_run() as run:
+                client = mlflow.MlflowClient()
+                client.log_image(run.info.run_id, image, key="dogs", step=3)
+
+        .. code-block:: python
+            :caption: Legacy artifact file image logging numpy example
+
+            import mlflow
             import numpy as np
 
-            return isinstance(image, np.ndarray)
+            image = np.random.randint(0, 256, size=(100, 100, 3), dtype=np.uint8)
+            with mlflow.start_run() as run:
+                client = mlflow.MlflowClient()
+                client.log_image(run.info.run_id, image, "image.png")
 
-        def _normalize_to_uint8(x):
-            # Based on: https://github.com/matplotlib/matplotlib/blob/06567e021f21be046b6d6dcf00380c1cb9adaf3c/lib/matplotlib/image.py#L684
+        .. code-block:: python
+            :caption: Legacy artifact file image logging pillow example
 
-            is_int = np.issubdtype(x.dtype, np.integer)
-            low = 0
-            high = 255 if is_int else 1
-            if x.min() < low or x.max() > high:
-                msg = (
-                    "Out-of-range values are detected. "
-                    f"Clipping array (dtype: '{x.dtype}') to [{low}, {high}]"
+            import mlflow
+            from PIL import Image
+
+            image = Image.new("RGB", (100, 100))
+            with mlflow.start_run() as run:
+                client = mlflow.MlflowClient()
+                client.log_image(run.info.run_id, image, "image.png")
+        """
+        if artifact_file is not None and any(arg is not None for arg in [key, step, timestamp]):
+            raise TypeError(
+                "The `artifact_file` parameter cannot be used in conjunction with `key`, "
+                "`step`, or `timestamp` parameters. Please ensure that `artifact_file` is "
+                "specified alone, without any of these conflicting parameters."
+            )
+        elif artifact_file is None and key is None:
+            raise TypeError(
+                "Invalid arguments: Please specify exactly one of `artifact_file` or `key`. Use "
+                "`key` to log dynamic image charts or `artifact_file` for saving static images. "
+            )
+
+        import numpy as np
+
+        # Convert image type to PIL if its a numpy array
+        if isinstance(image, np.ndarray):
+            image = convert_to_pil_image(image)
+        elif isinstance(image, Image):
+            image = image.to_pil()
+        else:
+            # Import PIL and check if the image is a PIL image
+            import PIL
+
+            if not isinstance(image, PIL.Image.Image):
+                raise TypeError(
+                    f"Unsupported image object type: {type(image)}. "
+                    "`image` must be one of numpy.ndarray, "
+                    "PIL.Image.Image, and mlflow.Image."
                 )
-                _logger.warning(msg)
-                x = np.clip(x, low, high)
 
-            # float or bool
-            if not is_int:
-                x = x * 255
-
-            return x.astype(np.uint8)
-
-        with self._log_artifact_helper(run_id, artifact_file) as tmp_path:
-            if "PIL" in sys.modules and _is_pillow_image(image):
+        if artifact_file is not None:
+            with self._log_artifact_helper(run_id, artifact_file) as tmp_path:
                 image.save(tmp_path)
-            elif "numpy" in sys.modules and _is_numpy_array(image):
-                import numpy as np
 
-                try:
-                    from PIL import Image
-                except ImportError as exc:
-                    raise ImportError(
-                        "`log_image` requires Pillow to serialize a numpy array as an image. "
-                        "Please install it via: pip install Pillow"
-                    ) from exc
+        elif key is not None:
+            # Check image key for invalid characters
+            if not re.match(r"^[a-zA-Z0-9_\-./ ]+$", key):
+                raise ValueError(
+                    "The `key` parameter may only contain alphanumerics, underscores (_), "
+                    "dashes (-), periods (.), spaces ( ), and slashes (/)."
+                    f"The provided key `{key}` contains invalid characters."
+                )
 
-                # Ref.: https://numpy.org/doc/stable/reference/generated/numpy.dtype.kind.html#numpy-dtype-kind
-                valid_data_types = {
-                    "b": "bool",
-                    "i": "signed integer",
-                    "u": "unsigned integer",
-                    "f": "floating",
-                }
+            step = step or 0
+            timestamp = timestamp or get_current_time_millis()
 
-                if image.dtype.kind not in valid_data_types:
-                    raise TypeError(
-                        f"Invalid array data type: '{image.dtype}'. "
-                        f"Must be one of {list(valid_data_types.values())}"
+            # Sanitize key to use in filename (replace / with # to avoid subdirectories)
+            sanitized_key = re.sub(r"/", "#", key)
+            filename_uuid = uuid.uuid4()
+            filename = f"images/{sanitized_key}%step%{step}%timestamp%{timestamp}%{filename_uuid}"
+            uncompressed_filename = (
+                f"images/{sanitized_key}%step%{step}%timestamp%{timestamp}%{filename_uuid}"
+            )
+            compressed_filename = f"{uncompressed_filename}%compressed"
+
+            # Save full-resolution image
+            image_filepath = f"{uncompressed_filename}.png"
+            with self._log_artifact_helper(run_id, image_filepath) as tmp_path:
+                image.save(tmp_path)
+
+            # Save compressed image
+            compressed_image_filepath = f"{compressed_filename}.webp"
+            with self._log_artifact_helper(run_id, compressed_image_filepath) as tmp_path:
+                compress_image_size(image).save(tmp_path)
+
+            # Save metadata file
+            metadata_filepath = f"{filename}.json"
+            with self._log_artifact_helper(run_id, metadata_filepath) as tmp_path:
+                with open(tmp_path, "w+") as f:
+                    json.dump(
+                        {
+                            "filepath": image_filepath,
+                            "key": key,
+                            "step": step,
+                            "timestamp": timestamp,
+                        },
+                        f,
                     )
 
-                if image.ndim not in [2, 3]:
-                    raise ValueError(
-                        f"`image` must be a 2D or 3D array but got a {image.ndim}D array"
-                    )
-
-                if (image.ndim == 3) and (image.shape[2] not in [1, 3, 4]):
-                    raise ValueError(
-                        f"Invalid channel length: {image.shape[2]}. Must be one of [1, 3, 4]"
-                    )
-
-                # squeeze a 3D grayscale image since `Image.fromarray` doesn't accept it.
-                if image.ndim == 3 and image.shape[2] == 1:
-                    image = image[:, :, 0]
-
-                image = _normalize_to_uint8(image)
-
-                Image.fromarray(image).save(tmp_path)
-
-            else:
-                raise TypeError(f"Unsupported image object type: '{type(image)}'")
+            # Log tag indicating that the run includes logged image
+            self.set_tag(run_id, MLFLOW_LOGGED_IMAGES, True, synchronous=False)
 
     def _check_artifact_file_string(self, artifact_file: str):
         """Check if the artifact_file contains any forbidden characters.
@@ -1584,7 +1662,8 @@ class MlflowClient:
             artifact_file: The run-relative artifact file path in posixpath format to which
                 the table is saved (e.g. "dir/file.json").
 
-        .. testcode:: python
+        .. code-block:: python
+            :test:
             :caption: Dictionary Example
 
             import mlflow
@@ -1595,13 +1674,14 @@ class MlflowClient:
                 "outputs": ["MLflow is ...", "Databricks is ..."],
                 "toxicity": [0.0, 0.0],
             }
-            client = MlflowClient()
-            run = client.create_run(experiment_id="0")
-            client.log_table(
-                run.info.run_id, data=table_dict, artifact_file="qabot_eval_results.json"
-            )
+            with mlflow.start_run() as run:
+                client = MlflowClient()
+                client.log_table(
+                    run.info.run_id, data=table_dict, artifact_file="qabot_eval_results.json"
+                )
 
-        .. testcode:: python
+        .. code-block:: python
+            :test:
             :caption: Pandas DF Example
 
             import mlflow
@@ -1614,9 +1694,27 @@ class MlflowClient:
                 "toxicity": [0.0, 0.0],
             }
             df = pd.DataFrame.from_dict(table_dict)
-            client = MlflowClient()
-            run = client.create_run(experiment_id="0")
-            client.log_table(run.info.run_id, data=df, artifact_file="qabot_eval_results.json")
+            with mlflow.start_run() as run:
+                client = MlflowClient()
+                client.log_table(run.info.run_id, data=df, artifact_file="qabot_eval_results.json")
+
+        .. code-block:: python
+            :test:
+            :caption: Image Column Example
+
+            import mlflow
+            import pandas as pd
+            from mlflow import MlflowClient
+
+            image = mlflow.Image([[1, 2, 3]])
+            table_dict = {
+                "inputs": ["Show me a dog", "Show me a cat"],
+                "outputs": [image, image],
+            }
+            df = pd.DataFrame.from_dict(table_dict)
+            with mlflow.start_run() as run:
+                client = MlflowClient()
+                client.log_table(run.info.run_id, data=df, artifact_file="image_gen.json")
         """
         import pandas as pd
 
@@ -1633,6 +1731,54 @@ class MlflowClient:
             # for data like {"inputs": "What is MLflow?"}
             except ValueError:
                 data = pd.DataFrame([data])
+
+        # Check if the column is a `PIL.Image.Image` or `mlflow.Image` object
+        # and save filepath
+        if len(data.select_dtypes(include=["object"]).columns) > 0:
+
+            def process_image(image):
+                # remove extension from artifact_file
+                table_name, _ = os.path.splitext(artifact_file)
+                # save image to path
+                filepath = posixpath.join("table_images", table_name, str(uuid.uuid4()))
+                image_filepath = filepath + ".png"
+                compressed_image_filepath = filepath + ".webp"
+                with self._log_artifact_helper(run_id, image_filepath) as artifact_path:
+                    image.save(artifact_path)
+
+                # save compressed image to path
+                compressed_image = compress_image_size(image)
+
+                with self._log_artifact_helper(run_id, compressed_image_filepath) as artifact_path:
+                    compressed_image.save(artifact_path)
+
+                # return a dictionary object indicating its an image path
+                return {
+                    "type": "image",
+                    "filepath": image_filepath,
+                    "compressed_filepath": compressed_image_filepath,
+                }
+
+            def check_is_image_object(obj):
+                return (
+                    hasattr(obj, "save")
+                    and callable(getattr(obj, "save"))
+                    and hasattr(obj, "resize")
+                    and callable(getattr(obj, "resize"))
+                    and hasattr(obj, "size")
+                )
+
+            for column in data.columns:
+                isImage = data[column].map(lambda x: check_is_image_object(x))
+                if any(isImage) and not all(isImage):
+                    raise ValueError(
+                        f"Column `{column}` contains a mix of images and non-images. "
+                        "Please ensure that all elements in the column are of the same type."
+                    )
+                elif all(isImage):
+                    # Save files to artifact storage
+                    data[column] = data[column].map(lambda x: process_image(x))
+
         norm_path = posixpath.normpath(artifact_file)
         artifact_dir = posixpath.dirname(norm_path)
         artifact_dir = None if artifact_dir == "" else artifact_dir
@@ -1651,7 +1797,7 @@ class MlflowClient:
 
         with self._log_artifact_helper(run_id, artifact_file) as artifact_path:
             try:
-                data.to_json(artifact_path, orient="split", index=False)
+                data.to_json(artifact_path, orient="split", index=False, date_format="iso")
             except Exception as e:
                 raise MlflowException(
                     f"Failed to save {data} as table as the data is not JSON serializable. "
@@ -1697,7 +1843,8 @@ class MlflowClient:
             pandas.DataFrame containing the loaded table if the artifact exists
             or else throw a MlflowException.
 
-         .. testcode:: python
+         .. code-block:: python
+            :test:
             :caption: Example with passing run_ids
 
             import mlflow
@@ -1723,7 +1870,8 @@ class MlflowClient:
                 extra_columns=["run_id"],
             )
 
-        .. testcode:: python
+        .. code-block:: python
+            :test:
             :caption: Example with passing no run_ids
 
             # Loads the table with the specified name for all runs in the given
@@ -2575,10 +2723,12 @@ class MlflowClient:
             import mlflow
             from mlflow import MlflowClient
 
+
             def print_model_info(rm):
                 print("--")
                 print("name: {}".format(rm.name))
                 print("tags: {}".format(rm.tags))
+
 
             name = "SocialMediaTextAnalyzer"
             tags = {"nlp.framework1": "Spark NLP"}
@@ -3320,9 +3470,7 @@ class MlflowClient:
         )
 
     @deprecated(since="2.9.0", impact=_STAGES_DEPRECATION_WARNING)
-    def get_model_version_stages(
-        self, name: str, version: str
-    ) -> List[str]:  # pylint: disable=unused-argument
+    def get_model_version_stages(self, name: str, version: str) -> List[str]:
         """
         This is a docstring. Here is info.
 
@@ -3546,7 +3694,7 @@ class MlflowClient:
             )
             latest_versions = self.get_latest_versions(name, stages=[stage])
             if not latest_versions:
-                raise MlflowException("Could not find any model version for {stage} stage")
+                raise MlflowException(f"Could not find any model version for {stage} stage")
             version = latest_versions[0].version
         self._get_registry_client().delete_model_version_tag(name, version, key)
 
@@ -3569,16 +3717,19 @@ class MlflowClient:
             from sklearn.datasets import make_regression
             from sklearn.ensemble import RandomForestRegressor
 
+
             def print_model_info(rm):
                 print("--Model--")
                 print("name: {}".format(rm.name))
                 print("aliases: {}".format(rm.aliases))
+
 
             def print_model_version_info(mv):
                 print("--Model Version--")
                 print("Name: {}".format(mv.name))
                 print("Version: {}".format(mv.version))
                 print("Aliases: {}".format(mv.aliases))
+
 
             mlflow.set_tracking_uri("sqlite:///mlruns.db")
             params = {"n_estimators": 3, "random_state": 42}
@@ -3651,16 +3802,19 @@ class MlflowClient:
             from sklearn.datasets import make_regression
             from sklearn.ensemble import RandomForestRegressor
 
+
             def print_model_info(rm):
                 print("--Model--")
                 print("name: {}".format(rm.name))
                 print("aliases: {}".format(rm.aliases))
+
 
             def print_model_version_info(mv):
                 print("--Model Version--")
                 print("Name: {}".format(mv.name))
                 print("Version: {}".format(mv.version))
                 print("Aliases: {}".format(mv.aliases))
+
 
             mlflow.set_tracking_uri("sqlite:///mlruns.db")
             params = {"n_estimators": 3, "random_state": 42}
@@ -3746,15 +3900,21 @@ class MlflowClient:
             from mlflow.models import infer_signature
             from sklearn.datasets import make_regression
             from sklearn.ensemble import RandomForestRegressor
+
+
             def print_model_info(rm):
                 print("--Model--")
                 print("name: {}".format(rm.name))
                 print("aliases: {}".format(rm.aliases))
+
+
             def print_model_version_info(mv):
                 print("--Model Version--")
                 print("Name: {}".format(mv.name))
                 print("Version: {}".format(mv.version))
                 print("Aliases: {}".format(mv.aliases))
+
+
             mlflow.set_tracking_uri("sqlite:///mlruns.db")
             params = {"n_estimators": 3, "random_state": 42}
             name = "RandomForestRegression"

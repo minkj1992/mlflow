@@ -111,6 +111,26 @@ MLFLOW_HTTP_REQUEST_BACKOFF_JITTER = _EnvironmentVariable(
 #: (default: ``120``)
 MLFLOW_HTTP_REQUEST_TIMEOUT = _EnvironmentVariable("MLFLOW_HTTP_REQUEST_TIMEOUT", int, 120)
 
+#: Specifies whether to respect Retry-After header on status codes defined as
+#: Retry.RETRY_AFTER_STATUS_CODES or not for MLflow HTTP request
+#: (default: ``True``)
+MLFLOW_HTTP_RESPECT_RETRY_AFTER_HEADER = _BooleanEnvironmentVariable(
+    "MLFLOW_HTTP_RESPECT_RETRY_AFTER_HEADER", True
+)
+
+#: Internal-only configuration that sets an upper bound to the allowable maximum
+#: retries for HTTP requests
+#: (default: ``10``)
+_MLFLOW_HTTP_REQUEST_MAX_RETRIES_LIMIT = _EnvironmentVariable(
+    "_MLFLOW_HTTP_REQUEST_MAX_RETRIES_LIMIT", int, 10
+)
+
+#: Internal-only configuration that sets the upper bound for an HTTP backoff_factor
+#: (default: ``120``)
+_MLFLOW_HTTP_REQUEST_MAX_BACKOFF_FACTOR_LIMIT = _EnvironmentVariable(
+    "_MLFLOW_HTTP_REQUEST_MAX_BACKOFF_FACTOR_LIMIT", int, 120
+)
+
 #: Specifies whether MLflow HTTP requests should be signed using AWS signature V4. It will overwrite
 #: (default: ``False``). When set, it will overwrite the "Authorization" HTTP header.
 #: See https://docs.aws.amazon.com/general/latest/gr/signature-version-4.html for more information.
@@ -225,6 +245,16 @@ MLFLOW_ARTIFACT_UPLOAD_DOWNLOAD_TIMEOUT = _EnvironmentVariable(
     "MLFLOW_ARTIFACT_UPLOAD_DOWNLOAD_TIMEOUT", int, None
 )
 
+#: Specifies the timeout for model inference with input example(s) when logging/saving a model.
+#: MLflow runs a few inference requests against the model to infer model signature and pip
+#: requirements. Sometimes the prediction hangs for a long time, especially for a large model.
+#: This timeout limits the allowable time for performing a prediction for signature inference
+#: and will abort the prediction, falling back to the default signature and pip requirements.
+MLFLOW_INPUT_EXAMPLE_INFERENCE_TIMEOUT = _EnvironmentVariable(
+    "MLFLOW_INPUT_EXAMPLE_INFERENCE_TIMEOUT", int, 180
+)
+
+
 #: Specifies the device intended for use in the predict function - can be used
 #: to override behavior where the GPU is used by default when available by
 #: setting this environment variable to be ``cpu``. Currently, this
@@ -268,9 +298,6 @@ MLFLOW_HUGGINGFACE_MODEL_MAX_SHARD_SIZE = _EnvironmentVariable(
 
 #: Specifies the name of the Databricks secret scope to use for storing OpenAI API keys.
 MLFLOW_OPENAI_SECRET_SCOPE = _EnvironmentVariable("MLFLOW_OPENAI_SECRET_SCOPE", str, None)
-
-#: Specifier whether or not to retry OpenAI API calls.
-MLFLOW_OPENAI_RETRIES_ENABLED = _BooleanEnvironmentVariable("MLFLOW_OPENAI_RETRIES_ENABLED", True)
 
 #: (Experimental, may be changed or removed)
 #: Specifies the download options to be used by pip wheel when `add_libraries_to_model` is used to
@@ -457,6 +484,11 @@ MLFLOW_SYSTEM_METRICS_SAMPLES_BEFORE_LOGGING = _EnvironmentVariable(
     "MLFLOW_SYSTEM_METRICS_SAMPLES_BEFORE_LOGGING", int, None
 )
 
+#: Specifies the node id of system metrics logging. This is useful in multi-node (distributed
+#: training) setup.
+MLFLOW_SYSTEM_METRICS_NODE_ID = _EnvironmentVariable("MLFLOW_SYSTEM_METRICS_NODE_ID", str, None)
+
+
 # Private environment variable to specify the number of chunk download retries for multipart
 # download.
 _MLFLOW_MPD_NUM_RETRIES = _EnvironmentVariable("_MLFLOW_MPD_NUM_RETRIES", int, 3)
@@ -498,4 +530,34 @@ MLFLOW_DEPLOYMENT_PREDICT_TIMEOUT = _EnvironmentVariable(
 
 MLFLOW_GATEWAY_RATE_LIMITS_STORAGE_URI = _EnvironmentVariable(
     "MLFLOW_GATEWAY_RATE_LIMITS_STORAGE_URI", str, None
+)
+
+#: If True, MLflow fluent logging APIs, e.g., `mlflow.log_metric` will log asynchronously.
+MLFLOW_ENABLE_ASYNC_LOGGING = _BooleanEnvironmentVariable("MLFLOW_ENABLE_ASYNC_LOGGING", False)
+
+#: Specifies whether or not to have mlflow configure logging on import.
+#: If set to True, mlflow will configure ``mlflow.<module_name>`` loggers with
+#: logging handlers and formatters.
+#: (default: ``True``)
+MLFLOW_CONFIGURE_LOGGING = _BooleanEnvironmentVariable("MLFLOW_LOGGING_CONFIGURE_LOGGING", True)
+
+#: If set to True, the following entities will be truncated to their maximum length:
+#: - Param value
+#: - Tag value
+#: If set to False, an exception will be raised if the length of the entity exceeds the maximum
+#: length.
+#: (default: ``True``)
+MLFLOW_TRUNCATE_LONG_VALUES = _BooleanEnvironmentVariable("MLFLOW_TRUNCATE_LONG_VALUES", True)
+
+# Whether to run slow tests with pytest. Default to False in normal runs,
+# but set to True in the weekly slow test jobs.
+_MLFLOW_RUN_SLOW_TESTS = _BooleanEnvironmentVariable("MLFLOW_RUN_SLOW_TESTS", False)
+
+#: The OpenJDK version to install in the Docker image used for MLflow models.
+#: (default: ``11``)
+MLFLOW_DOCKER_OPENJDK_VERSION = _EnvironmentVariable("MLFLOW_DOCKER_OPENJDK_VERSION", str, "11")
+
+# Whether to use presigned URLs to interact with the Unity Catalog
+MLFLOW_UNITY_CATALOG_PRESIGNED_URLS_ENABLED = _BooleanEnvironmentVariable(
+    "MLFLOW_UNITY_CATALOG_PRESIGNED_URLS_ENABLED", False
 )

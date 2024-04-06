@@ -11,31 +11,49 @@ LangChain (native) format
 .. _LangChain:
     https://python.langchain.com/en/latest/index.html
 """
+
 import contextlib
 import functools
+import importlib.util
 import logging
 import os
-from typing import Any, Dict, List, Optional, Union
+import sys
+import uuid
+import warnings
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List, Optional, Union
 
+import cloudpickle
 import pandas as pd
 import yaml
+from packaging.version import Version
 
 import mlflow
 from mlflow import pyfunc
 from mlflow.environment_variables import _MLFLOW_TESTING
+from mlflow.exceptions import MlflowException
 from mlflow.langchain._langchain_autolog import (
     _update_langchain_model_config,
     patched_inference,
 )
+from mlflow.langchain._rag_utils import _CODE_CONFIG, _CODE_PATH, _set_config_path
+from mlflow.langchain.databricks_dependencies import (
+    _DATABRICKS_DEPENDENCY_KEY,
+    _detect_databricks_dependencies,
+)
 from mlflow.langchain.runnables import _load_runnables, _save_runnables
 from mlflow.langchain.utils import (
     _BASE_LOAD_KEY,
+    _MODEL_DATA_FOLDER_NAME,
+    _MODEL_DATA_PKL_FILE_NAME,
     _MODEL_LOAD_KEY,
+    _PERSIST_DIR_NAME,
     _RUNNABLE_LOAD_KEY,
     _load_base_lcs,
     _save_base_lcs,
     _validate_and_wrap_lc_model,
     lc_runnables_types,
+    register_pydantic_v1_serializer_cm,
 )
 from mlflow.models import Model, ModelInputExample, ModelSignature, get_model_info
 from mlflow.models.model import MLMODEL_FILE_NAME
@@ -44,7 +62,7 @@ from mlflow.models.utils import _save_example
 from mlflow.tracking._model_registry import DEFAULT_AWAIT_MAX_SLEEP_SECONDS
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
 from mlflow.types.schema import ColSpec, DataType, Schema
-from mlflow.utils.annotations import experimental
+from mlflow.utils.annotations import deprecated, experimental
 from mlflow.utils.autologging_utils import (
     autologging_integration,
     autologging_is_disabled,
@@ -64,6 +82,7 @@ from mlflow.utils.environment import (
 )
 from mlflow.utils.file_utils import get_total_file_size, write_to
 from mlflow.utils.model_utils import (
+    FLAVOR_CONFIG_CODE,
     _add_code_from_conf_to_system_path,
     _get_flavor_configuration,
     _validate_and_copy_code_paths,
@@ -77,6 +96,13 @@ FLAVOR_NAME = "langchain"
 _MODEL_TYPE_KEY = "model_type"
 
 
+model_data_artifact_paths = [
+    _MODEL_DATA_FOLDER_NAME,
+    _MODEL_DATA_PKL_FILE_NAME,
+    _PERSIST_DIR_NAME,
+]
+
+
 def get_default_pip_requirements():
     """
     Returns:
@@ -84,7 +110,9 @@ def get_default_pip_requirements():
         Calls to :func:`save_model()` and :func:`log_model()` produce a pip environment
         that, at a minimum, contains these requirements.
     """
-    return [_get_pinned_requirement("langchain")]
+    # pin pydantic and cloudpickle version as they are used in langchain
+    # model saving and loading
+    return list(map(_get_pinned_requirement, ["langchain", "pydantic", "cloudpickle"]))
 
 
 def get_default_conda_env():
@@ -179,6 +207,9 @@ def save_model(
             Here is the code snippet for logging a RetrievalQA chain with `loader_fn`
             and `persist_dir`:
 
+            .. Note:: In langchain_community >= 0.0.27, loading pickled data requires providing the
+                ``allow_dangerous_deserialization`` argument.
+
             .. code-block:: python
 
                 qa = RetrievalQA.from_llm(llm=OpenAI(), retriever=db.as_retriever())
@@ -186,7 +217,13 @@ def save_model(
 
                 def load_retriever(persist_directory):
                     embeddings = OpenAIEmbeddings()
-                    vectorstore = FAISS.load_local(persist_directory, embeddings)
+                    vectorstore = FAISS.load_local(
+                        persist_directory,
+                        embeddings,
+                        # you may need to add the line below
+                        # for langchain_community >= 0.0.27
+                        allow_dangerous_deserialization=True,
+                    )
                     return vectorstore.as_retriever()
 
 
@@ -210,7 +247,30 @@ def save_model(
 
     path = os.path.abspath(path)
     _validate_and_prepare_target_save_path(path)
-    code_dir_subpath = _validate_and_copy_code_paths(code_paths, path)
+    formatted_code_path = code_paths[:] if code_paths else []
+    if isinstance(lc_model, str):
+        # The LangChain model is defined as Python code located in the file at the path
+        # specified by `lc_model`. Verify that the path exists and, if so, copy it to the
+        # model directory along with any other specified code modules
+
+        if os.path.exists(lc_model):
+            formatted_code_path.append(lc_model)
+        else:
+            raise mlflow.MlflowException.invalid_parameter_value(
+                f"If the {lc_model} is a string, it must be a valid python "
+                "file path containing the code for defining the chain instance."
+            )
+
+        if len(code_paths) > 1:
+            raise mlflow.MlflowException.invalid_parameter_value(
+                "When the model is a string, and if the code_paths are specified, "
+                "it should contain only one path."
+                "This config path is used to set config.yml file path "
+                "for the model. This path should be passed in via the code_paths. "
+                f"Current code paths: {code_paths}"
+            )
+
+    code_dir_subpath = _validate_and_copy_code_paths(formatted_code_path, path)
 
     if signature is None:
         if input_example is not None:
@@ -256,7 +316,25 @@ def save_model(
     if metadata is not None:
         mlflow_model.metadata = metadata
 
-    model_data_kwargs = _save_model(lc_model, path, loader_fn, persist_dir)
+    streamable = isinstance(lc_model, lc_runnables_types())
+
+    if not isinstance(lc_model, str):
+        model_data_kwargs = _save_model(lc_model, path, loader_fn, persist_dir)
+        flavor_conf = {
+            _MODEL_TYPE_KEY: lc_model.__class__.__name__,
+            **model_data_kwargs,
+        }
+    else:
+        # If the model is a string, we expect the code_path which is ideally config.yml
+        # would be used in the model. We set the code_path here so it can be set
+        # globally when the model is loaded with the local path. So the consumer
+        # can use that path instead of the config.yml path when the model is loaded
+        flavor_conf = (
+            {_CODE_CONFIG: code_paths[0], _CODE_PATH: lc_model}
+            if code_paths and len(code_paths) >= 1
+            else {_CODE_CONFIG: None, _CODE_PATH: lc_model}
+        )
+        model_data_kwargs = {}
 
     pyfunc.add_to_model(
         mlflow_model,
@@ -264,16 +342,28 @@ def save_model(
         conda_env=_CONDA_ENV_FILE_NAME,
         python_env=_PYTHON_ENV_FILE_NAME,
         code=code_dir_subpath,
+        predict_stream_fn="predict_stream",
+        streamable=streamable,
         **model_data_kwargs,
     )
-    flavor_conf = {
-        _MODEL_TYPE_KEY: lc_model.__class__.__name__,
-        **model_data_kwargs,
-    }
+
+    if Version(langchain.__version__) >= Version("0.0.311"):
+        checker_model = lc_model
+        if isinstance(lc_model, str):
+            checker_model = (
+                _load_model_code_path(lc_model, code_paths[0])
+                if code_paths and len(code_paths) >= 1
+                else _load_model_code_path(lc_model)
+            )
+
+        if databricks_dependency := _detect_databricks_dependencies(checker_model):
+            flavor_conf[_DATABRICKS_DEPENDENCY_KEY] = databricks_dependency
+
     mlflow_model.add_flavor(
         FLAVOR_NAME,
         langchain_version=langchain.__version__,
         code=code_dir_subpath,
+        streamable=streamable,
         **flavor_conf,
     )
     if size := get_total_file_size(path):
@@ -399,6 +489,9 @@ def log_model(
             Here is the code snippet for logging a RetrievalQA chain with `loader_fn`
             and `persist_dir`:
 
+            .. Note:: In langchain_community >= 0.0.27, loading pickled data requires providing the
+                ``allow_dangerous_deserialization`` argument.
+
             .. code-block:: python
 
                 qa = RetrievalQA.from_llm(llm=OpenAI(), retriever=db.as_retriever())
@@ -406,7 +499,13 @@ def log_model(
 
                 def load_retriever(persist_directory):
                     embeddings = OpenAIEmbeddings()
-                    vectorstore = FAISS.load_local(persist_directory, embeddings)
+                    vectorstore = FAISS.load_local(
+                        persist_directory,
+                        embeddings,
+                        # you may need to add the line below
+                        # for langchain_community >= 0.0.27
+                        allow_dangerous_deserialization=True,
+                    )
                     return vectorstore.as_retriever()
 
 
@@ -451,10 +550,18 @@ def log_model(
 
 
 def _save_model(model, path, loader_fn, persist_dir):
-    if isinstance(model, lc_runnables_types()):
-        return _save_runnables(model, path, loader_fn=loader_fn, persist_dir=persist_dir)
-    else:
-        return _save_base_lcs(model, path, loader_fn, persist_dir)
+    if Version(cloudpickle.__version__) < Version("2.1.0"):
+        warnings.warn(
+            "If you are constructing a custom LangChain model, "
+            "please upgrade cloudpickle to version 2.1.0 or later "
+            "using `pip install cloudpickle>=2.1.0` "
+            "to ensure the model can be loaded correctly."
+        )
+    with register_pydantic_v1_serializer_cm():
+        if isinstance(model, lc_runnables_types()):
+            return _save_runnables(model, path, loader_fn=loader_fn, persist_dir=persist_dir)
+        else:
+            return _save_base_lcs(model, path, loader_fn, persist_dir)
 
 
 def _load_model(local_model_path, flavor_conf):
@@ -462,15 +569,16 @@ def _load_model(local_model_path, flavor_conf):
     # of supported types, we define _MODEL_LOAD_KEY to ensure
     # which load function to use
     model_load_fn = flavor_conf.get(_MODEL_LOAD_KEY)
-    if model_load_fn == _RUNNABLE_LOAD_KEY:
-        model = _load_runnables(local_model_path, flavor_conf)
-    elif model_load_fn == _BASE_LOAD_KEY:
-        model = _load_base_lcs(local_model_path, flavor_conf)
-    else:
-        raise mlflow.MlflowException(
-            "Failed to load LangChain model. Unknown model type: "
-            f"{flavor_conf.get(_MODEL_TYPE_KEY)}"
-        )
+    with register_pydantic_v1_serializer_cm():
+        if model_load_fn == _RUNNABLE_LOAD_KEY:
+            model = _load_runnables(local_model_path, flavor_conf)
+        elif model_load_fn == _BASE_LOAD_KEY:
+            model = _load_base_lcs(local_model_path, flavor_conf)
+        else:
+            raise mlflow.MlflowException(
+                "Failed to load LangChain model. Unknown model type: "
+                f"{flavor_conf.get(_MODEL_TYPE_KEY)}"
+            )
     # To avoid double logging, we set model_logged to True
     # when the model is loaded
     if not autologging_is_disabled(FLAVOR_NAME):
@@ -480,15 +588,29 @@ def _load_model(local_model_path, flavor_conf):
     return model
 
 
+# numpy array is not json serializable, so we convert it to list
+# then send it to the model
+def _convert_ndarray_to_list(data):
+    import numpy as np
+
+    if isinstance(data, np.ndarray):
+        return data.tolist()
+    if isinstance(data, list):
+        return [_convert_ndarray_to_list(d) for d in data]
+    if isinstance(data, dict):
+        return {k: _convert_ndarray_to_list(v) for k, v in data.items()}
+    return data
+
+
 class _LangChainModelWrapper:
     def __init__(self, lc_model):
         self.lc_model = lc_model
 
-    def predict(  # pylint: disable=unused-argument
+    def predict(
         self,
         data: Union[pd.DataFrame, List[Union[str, Dict[str, Any]]], Any],
-        params: Optional[Dict[str, Any]] = None,  # pylint: disable=unused-argument
-    ) -> List[str]:
+        params: Optional[Dict[str, Any]] = None,
+    ) -> List[Union[str, Dict[str, Any]]]:
         """
         Args:
             data: Model input data.
@@ -500,23 +622,20 @@ class _LangChainModelWrapper:
         Returns:
             Model predictions.
         """
-        messages = self._prepare_messages(data)
         from mlflow.langchain.api_request_parallel_processor import process_api_requests
 
-        return_first_element = isinstance(self.lc_model, lc_runnables_types()) and not isinstance(
-            data, pd.DataFrame
-        )
+        messages, return_first_element = self._prepare_messages(data)
         results = process_api_requests(lc_model=self.lc_model, requests=messages)
         return results[0] if return_first_element else results
 
     @experimental
-    def _predict_with_callbacks(  # pylint: disable=unused-argument
+    def _predict_with_callbacks(
         self,
         data: Union[pd.DataFrame, List[Union[str, Dict[str, Any]]], Any],
-        params: Optional[Dict[str, Any]] = None,  # pylint: disable=unused-argument
+        params: Optional[Dict[str, Any]] = None,
         callback_handlers=None,
         convert_chat_responses=False,
-    ) -> List[str]:
+    ) -> List[Union[str, Dict[str, Any]]]:
         """
         Args:
             data: Model input data.
@@ -524,17 +643,16 @@ class _LangChainModelWrapper:
 
                 .. Note:: Experimental: This parameter may change or be removed in a future
                     release without warning.
-            data: Callback handlers to pass to LangChain.
+            callback_handlers: Callback handlers to pass to LangChain.
+            convert_chat_responses: If true, forcibly convert response to chat model
+                response format.
 
         Returns:
             Model predictions.
         """
-        messages = self._prepare_messages(data)
         from mlflow.langchain.api_request_parallel_processor import process_api_requests
 
-        return_first_element = isinstance(self.lc_model, lc_runnables_types()) and not isinstance(
-            data, pd.DataFrame
-        )
+        messages, return_first_element = self._prepare_messages(data)
         results = process_api_requests(
             lc_model=self.lc_model,
             requests=messages,
@@ -544,33 +662,90 @@ class _LangChainModelWrapper:
         return results[0] if return_first_element else results
 
     def _prepare_messages(self, data):
-        # numpy array is not json serializable, so we convert it to list
-        # then send it to the model
-        def _convert_ndarray_to_list(data):
-            import numpy as np
-
-            if isinstance(data, np.ndarray):
-                return data.tolist()
-            if isinstance(data, list):
-                return [_convert_ndarray_to_list(d) for d in data]
-            if isinstance(data, dict):
-                return {k: _convert_ndarray_to_list(v) for k, v in data.items()}
-            return data
-
+        """
+        Return a tuple of (preprocessed_data, return_first_element)
+        `preprocessed_data` is always a list,
+        and `return_first_element` means if True, we should return the first element
+        of inference result, otherwise we should return the whole inference result.
+        """
         if isinstance(data, pd.DataFrame):
-            return data.to_dict(orient="records")
+            data = data.to_dict(orient="records")
 
         data = _convert_ndarray_to_list(data)
-        if isinstance(self.lc_model, lc_runnables_types()):
-            return [data]
-        if isinstance(data, list) and (
-            all(isinstance(d, str) for d in data) or all(isinstance(d, dict) for d in data)
-        ):
-            return data
+        if not isinstance(data, list):
+            # if the input data is not a list (i.e. single input),
+            # we still need to convert it to a one-element list `[data]`
+            # because `process_api_requests` only accepts list as valid input.
+            # and in this case,
+            # we should return the first element of the inference result
+            # because we change input `data` to `[data]`
+            return [data], True
+        if isinstance(data, list):
+            return data, False
         raise mlflow.MlflowException.invalid_parameter_value(
-            "Input must be a pandas DataFrame or a list of strings "
-            "or a list of dictionaries "
+            "Input must be a pandas DataFrame or a list "
             f"for model {self.lc_model.__class__.__name__}"
+        )
+
+    def predict_stream(
+        self,
+        data: Any,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Iterator[Union[str, Dict[str, Any]]]:
+        """
+        Args:
+            data: Model input data, only single input is allowed.
+            params: Additional parameters to pass to the model for inference.
+
+                .. Note:: Experimental: This parameter may change or be removed in a future
+                    release without warning.
+
+        Returns:
+            An iterator of model prediction chunks.
+        """
+        from mlflow.langchain.api_request_parallel_processor import process_stream_request
+
+        if isinstance(data, list):
+            raise MlflowException("LangChain model predict_stream only supports single input.")
+
+        data = _convert_ndarray_to_list(data)
+        return process_stream_request(
+            lc_model=self.lc_model,
+            request_json=data,
+        )
+
+    def _predict_stream_with_callbacks(
+        self,
+        data: Any,
+        params: Optional[Dict[str, Any]] = None,
+        callback_handlers=None,
+        convert_chat_responses=False,
+    ) -> Iterator[Union[str, Dict[str, Any]]]:
+        """
+        Args:
+            data: Model input data, only single input is allowed.
+            params: Additional parameters to pass to the model for inference.
+
+                .. Note:: Experimental: This parameter may change or be removed in a future
+                    release without warning.
+            callback_handlers: Callback handlers to pass to LangChain.
+            convert_chat_responses: If true, forcibly convert response to chat model
+                response format.
+
+        Returns:
+            An iterator of model prediction chunks.
+        """
+        from mlflow.langchain.api_request_parallel_processor import process_stream_request
+
+        if isinstance(data, list):
+            raise MlflowException("LangChain model predict_stream only supports single input.")
+
+        data = _convert_ndarray_to_list(data)
+        return process_stream_request(
+            lc_model=self.lc_model,
+            request_json=data,
+            callback_handlers=callback_handlers,
+            convert_chat_responses=convert_chat_responses,
         )
 
 
@@ -580,7 +755,9 @@ class _TestLangChainWrapper(_LangChainModelWrapper):
     """
 
     def predict(
-        self, data, params: Optional[Dict[str, Any]] = None  # pylint: disable=unused-argument
+        self,
+        data,
+        params: Optional[Dict[str, Any]] = None,
     ):
         """
         Model input data and additional parameters.
@@ -650,8 +827,29 @@ def _load_pyfunc(path):
 
 def _load_model_from_local_fs(local_model_path):
     flavor_conf = _get_flavor_configuration(model_path=local_model_path, flavor_name=FLAVOR_NAME)
-    _add_code_from_conf_to_system_path(local_model_path, flavor_conf)
-    return _load_model(local_model_path, flavor_conf)
+    if _CODE_CONFIG in flavor_conf:
+        path = flavor_conf.get(_CODE_CONFIG)
+        flavor_code_config = flavor_conf.get(FLAVOR_CONFIG_CODE)
+        if path is not None:
+            config_path = os.path.join(
+                local_model_path,
+                flavor_code_config,
+                os.path.basename(path),
+            )
+        else:
+            config_path = None
+
+        flavor_code_path = flavor_conf.get(_CODE_PATH, "chain.py")
+        code_path = os.path.join(
+            local_model_path,
+            flavor_code_config,
+            os.path.basename(flavor_code_path),
+        )
+
+        return _load_model_code_path(code_path, config_path)
+    else:
+        _add_code_from_conf_to_system_path(local_model_path, flavor_conf)
+        return _load_model(local_model_path, flavor_conf)
 
 
 @experimental
@@ -681,6 +879,50 @@ def load_model(model_uri, dst_path=None):
     return _load_model_from_local_fs(local_model_path)
 
 
+@contextmanager
+def _config_path_context(code_path: Optional[str] = None):
+    _set_config_path(code_path)
+    try:
+        yield
+    finally:
+        _set_config_path(None)
+
+
+# In the Python's module caching mechanism, which by default, prevents the
+# re-importation of previously loaded modules. This is particularly
+# problematic in contexts where it's necessary to reload a module (in this case,
+# the `model code path` module) multiple times within the same Python
+# runtime environment.
+# The issue at hand arises from the desire to import the `model code path` module
+# multiple times during a single runtime session. Normally, once a module is
+# imported, it's added to `sys.modules`, and subsequent import attempts retrieve
+# the cached module rather than re-importing it.
+# To address this, the function dynamically imports the `model code path` module
+# under unique, dynamically generated module names. This is achieved by creating
+# a unique name for each import using a combination of the original module name
+# and a randomly generated UUID. This approach effectively bypasses the caching
+# mechanism, as each import is considered as a separate module by the Python interpreter.
+def _load_model_code_path(code_path: str, config_path: Optional[str] = None):
+    with _config_path_context(config_path):
+        try:
+            new_module_name = f"code_model_{uuid.uuid4().hex}"
+            spec = importlib.util.spec_from_file_location(new_module_name, code_path)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[new_module_name] = module
+            spec.loader.exec_module(module)
+        except ImportError as e:
+            raise mlflow.MlflowException("Failed to import LangChain model.") from e
+
+    return mlflow.langchain._rag_utils.__databricks_rag_chain__
+
+
+# TODO: We are keeping this method even though it is private because
+# rag studio is explicitly monkey patching it. Will remove soon.
+@deprecated(alternative="mlflow.langchain._load_model_code_path")
+def _load_code_model(config_path: Optional[str] = None):
+    pass
+
+
 @experimental
 @autologging_integration(FLAVOR_NAME)
 def autolog(
@@ -695,47 +937,48 @@ def autolog(
     silent=False,
     registered_model_name=None,
     extra_tags=None,
-):  # pylint: disable=unused-argument
+):
     """
     Enables (or disables) and configures autologging from Langchain to MLflow.
 
-    :param log_input_examples: If ``True``, input examples from inference data are collected and
-                               logged along with Langchain model artifacts during inference. If
-                               ``False``, input examples are not logged.
-                               Note: Input examples are MLflow model attributes
-                               and are only collected if ``log_models`` is also ``True``.
-    :param log_model_signatures: If ``True``,
-                                 :py:class:`ModelSignatures <mlflow.models.ModelSignature>`
-                                 describing model inputs and outputs are collected and logged along
-                                 with Langchain model artifacts during inference. If ``False``,
-                                 signatures are not logged.
-                                 Note: Model signatures are MLflow model attributes
-                                 and are only collected if ``log_models`` is also ``True``.
-    :param log_models: If ``True``, langchain models are logged as MLflow model artifacts.
-                       If ``False``, langchain models are not logged.
-                       Input examples and model signatures, which are attributes of MLflow models,
-                       are also omitted when ``log_models`` is ``False``.
-    :param log_datasets: If ``True``, dataset information is logged to MLflow Tracking
-                         if applicable. If ``False``, dataset information is not logged.
-    :param log_inputs_outputs: If ``True``, inference data and results are combined into a single
-                                  pandas DataFrame and logged to MLflow Tracking as an artifact.
-                                  If ``False``, inference data and results are not logged.
-                                  Default to ``True``.
-    :param disable: If ``True``, disables the Langchain autologging integration. If ``False``,
-                    enables the Langchain autologging integration.
-    :param exclusive: If ``True``, autologged content is not logged to user-created fluent runs.
-                      If ``False``, autologged content is logged to the active fluent run,
-                      which may be user-created.
-    :param disable_for_unsupported_versions: If ``True``, disable autologging for versions of
-                      langchain that have not been tested against this version of the MLflow
-                      client or are incompatible.
-    :param silent: If ``True``, suppress all event logs and warnings from MLflow during Langchain
-                   autologging. If ``False``, show all events and warnings during Langchain
-                   autologging.
-    :param registered_model_name: If given, each time a model is trained, it is registered as a
-                                  new model version of the registered model with this name.
-                                  The registered model is created if it does not already exist.
-    :param extra_tags: A dictionary of extra tags to set on each managed run created by autologging.
+    Args:
+        log_input_examples: If ``True``, input examples from inference data are collected and
+            logged along with Langchain model artifacts during inference. If
+            ``False``, input examples are not logged.
+            Note: Input examples are MLflow model attributes
+            and are only collected if ``log_models`` is also ``True``.
+        log_model_signatures: If ``True``,
+            :py:class:`ModelSignatures <mlflow.models.ModelSignature>`
+            describing model inputs and outputs are collected and logged along
+            with Langchain model artifacts during inference. If ``False``,
+            signatures are not logged.
+            Note: Model signatures are MLflow model attributes
+            and are only collected if ``log_models`` is also ``True``.
+        log_models: If ``True``, langchain models are logged as MLflow model artifacts.
+            If ``False``, langchain models are not logged.
+            Input examples and model signatures, which are attributes of MLflow models,
+            are also omitted when ``log_models`` is ``False``.
+        log_datasets: If ``True``, dataset information is logged to MLflow Tracking
+            if applicable. If ``False``, dataset information is not logged.
+        log_inputs_outputs: If ``True``, inference data and results are combined into a single
+            pandas DataFrame and logged to MLflow Tracking as an artifact.
+            If ``False``, inference data and results are not logged.
+            Default to ``True``.
+        disable: If ``True``, disables the Langchain autologging integration. If ``False``,
+            enables the Langchain autologging integration.
+        exclusive: If ``True``, autologged content is not logged to user-created fluent runs.
+            If ``False``, autologged content is logged to the active fluent run,
+            which may be user-created.
+        disable_for_unsupported_versions: If ``True``, disable autologging for versions of
+            langchain that have not been tested against this version of the MLflow
+            client or are incompatible.
+        silent: If ``True``, suppress all event logs and warnings from MLflow during Langchain
+            autologging. If ``False``, show all events and warnings during Langchain
+            autologging.
+        registered_model_name: If given, each time a model is trained, it is registered as a
+            new model version of the registered model with this name.
+            The registered model is created if it does not already exist.
+        extra_tags: A dictionary of extra tags to set on each managed run created by autologging.
     """
 
     with contextlib.suppress(ImportError):
@@ -745,13 +988,21 @@ def autolog(
 
         classes = lc_runnables_types() + (AgentExecutor, Chain)
         for cls in classes:
-            # IF runnable also contains loader_fn and persist_dir, warn
-            # BaseRetrievalQA, BaseREtriever, ...
-            safe_patch(FLAVOR_NAME, cls, "invoke", functools.partial(patched_inference, "invoke"))
+            # If runnable also contains loader_fn and persist_dir, warn
+            # BaseRetrievalQA, BaseRetriever, ...
+            safe_patch(
+                FLAVOR_NAME,
+                cls,
+                "invoke",
+                functools.partial(patched_inference, "invoke"),
+            )
 
         for cls in [AgentExecutor, Chain]:
             safe_patch(
-                FLAVOR_NAME, cls, "__call__", functools.partial(patched_inference, "__call__")
+                FLAVOR_NAME,
+                cls,
+                "__call__",
+                functools.partial(patched_inference, "__call__"),
             )
 
         safe_patch(

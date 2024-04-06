@@ -35,6 +35,7 @@ from mlflow.entities import (
 )
 from mlflow.exceptions import MlflowException
 from mlflow.models import Model
+from mlflow.server.handlers import _get_sampled_steps_from_steps
 from mlflow.store.tracking.sqlalchemy_store import SqlAlchemyStore
 from mlflow.utils import mlflow_tags
 from mlflow.utils.file_utils import TempDir, path_to_local_file_uri
@@ -1018,7 +1019,7 @@ def test_get_metric_history_bulk_calls_optimized_impl_when_expected(tmp_path):
 
         def to_dict(
             self,
-            flat,  # pylint: disable=unused-argument
+            flat,
         ):
             return self.args_dict
 
@@ -1043,6 +1044,170 @@ def test_get_metric_history_bulk_calls_optimized_impl_when_expected(tmp_path):
             metric_key="mock_key",
             max_results=25000,
         )
+
+
+def test_get_metric_history_bulk_interval_rejects_invalid_requests(mlflow_client):
+    def assert_response(resp, message_part):
+        assert resp.status_code == 400
+        response_json = resp.json()
+        assert response_json.get("error_code") == "INVALID_PARAMETER_VALUE"
+        assert message_part in response_json.get("message", "")
+
+    url = f"{mlflow_client.tracking_uri}/ajax-api/2.0/mlflow/metrics/get-history-bulk-interval"
+
+    assert_response(
+        requests.get(url, params={"metric_key": "key"}),
+        "Missing value for required parameter 'run_ids'.",
+    )
+
+    assert_response(
+        requests.get(url, params={"run_ids": [], "metric_key": "key"}),
+        "Missing value for required parameter 'run_ids'.",
+    )
+
+    assert_response(
+        requests.get(
+            url, params={"run_ids": [f"id_{i}" for i in range(1000)], "metric_key": "key"}
+        ),
+        "GetMetricHistoryBulkInterval request must specify at most 100 run_ids.",
+    )
+
+    assert_response(
+        requests.get(url, params={"run_ids": ["123"], "metric_key": "key", "max_results": 0}),
+        "max_results must be between 1 and 2500",
+    )
+
+    assert_response(
+        requests.get(url, params={"run_ids": ["123"], "metric_key": ""}),
+        "Missing value for required parameter 'metric_key'",
+    )
+
+    assert_response(
+        requests.get(url, params={"run_ids": ["123"], "max_results": 5}),
+        "Missing value for required parameter 'metric_key'",
+    )
+
+    assert_response(
+        requests.get(
+            url,
+            params={
+                "run_ids": ["123"],
+                "metric_key": "key",
+                "start_step": 1,
+                "end_step": 0,
+                "max_results": 5,
+            },
+        ),
+        "end_step must be greater than start_step. ",
+    )
+
+    assert_response(
+        requests.get(
+            url, params={"run_ids": ["123"], "metric_key": "key", "start_step": 1, "max_results": 5}
+        ),
+        "If either start step or end step are specified, both must be specified.",
+    )
+
+
+def test_get_metric_history_bulk_interval_respects_max_results(mlflow_client):
+    experiment_id = mlflow_client.create_experiment("get metric history bulk")
+    run_id1 = mlflow_client.create_run(experiment_id).info.run_id
+    metric_history = [
+        {"key": "metricA", "timestamp": 1, "step": i, "value": 10.0} for i in range(10)
+    ]
+    for metric in metric_history:
+        mlflow_client.log_metric(run_id1, **metric)
+
+    url = f"{mlflow_client.tracking_uri}/ajax-api/2.0/mlflow/metrics/get-history-bulk-interval"
+    response_limited = requests.get(
+        url,
+        params={"run_ids": [run_id1], "metric_key": "metricA", "max_results": 5},
+    )
+    assert response_limited.status_code == 200
+    expected_steps = [0, 2, 4, 6, 8, 9]
+    expected_metrics = [
+        {**metric, "run_id": run_id1}
+        for metric in metric_history
+        if metric["step"] in expected_steps
+    ]
+    assert response_limited.json().get("metrics") == expected_metrics
+
+    # with start_step and end_step
+    response_limited = requests.get(
+        url,
+        params={
+            "run_ids": [run_id1],
+            "metric_key": "metricA",
+            "start_step": 0,
+            "end_step": 4,
+            "max_results": 5,
+        },
+    )
+    assert response_limited.status_code == 200
+    assert response_limited.json().get("metrics") == [
+        {**metric, "run_id": run_id1} for metric in metric_history[:5]
+    ]
+
+    # multiple runs
+    run_id2 = mlflow_client.create_run(experiment_id).info.run_id
+    metric_history2 = [
+        {"key": "metricA", "timestamp": 1, "step": i, "value": 10.0} for i in range(20)
+    ]
+    for metric in metric_history2:
+        mlflow_client.log_metric(run_id2, **metric)
+    response_limited = requests.get(
+        url,
+        params={"run_ids": [run_id1, run_id2], "metric_key": "metricA", "max_results": 5},
+    )
+    expected_steps = [0, 4, 8, 9, 12, 16, 19]
+    expected_metrics = []
+    for run_id, metric_history in [(run_id1, metric_history), (run_id2, metric_history2)]:
+        expected_metrics.extend(
+            [
+                {**metric, "run_id": run_id}
+                for metric in metric_history
+                if metric["step"] in expected_steps
+            ]
+        )
+    assert response_limited.json().get("metrics") == expected_metrics
+
+    # test metrics with same steps
+    metric_history_timestamp2 = [
+        {"key": "metricA", "timestamp": 2, "step": i, "value": 10.0} for i in range(10)
+    ]
+    for metric in metric_history_timestamp2:
+        mlflow_client.log_metric(run_id1, **metric)
+
+    response_limited = requests.get(
+        url,
+        params={"run_ids": [run_id1], "metric_key": "metricA", "max_results": 5},
+    )
+    assert response_limited.status_code == 200
+    expected_steps = [0, 2, 4, 6, 8, 9]
+    expected_metrics = [
+        {"key": "metricA", "timestamp": j, "step": i, "value": 10.0, "run_id": run_id1}
+        for i in expected_steps
+        for j in [1, 2]
+    ]
+    assert response_limited.json().get("metrics") == expected_metrics
+
+
+@pytest.mark.parametrize(
+    ("min_step", "max_step", "max_results", "nums", "expected"),
+    [
+        # should be evenly spaced and include the beginning and
+        # end despite sometimes making it go above max_results
+        (0, 10, 5, list(range(10)), {0, 2, 4, 6, 8, 9}),
+        # if the clipped list is shorter than max_results,
+        # then everything will be returned
+        (4, 8, 5, list(range(10)), {4, 5, 6, 7, 8}),
+        # works if steps are logged in intervals
+        (0, 100, 5, list(range(0, 101, 20)), {0, 20, 40, 60, 80, 100}),
+        (0, 1000, 5, list(range(0, 1001, 10)), {0, 200, 400, 600, 800, 1000}),
+    ],
+)
+def test_get_sampled_steps_from_steps(min_step, max_step, max_results, nums, expected):
+    assert _get_sampled_steps_from_steps(min_step, max_step, max_results, nums) == expected
 
 
 def test_search_dataset_handler_rejects_invalid_requests(mlflow_client):
@@ -1740,8 +1905,7 @@ def test_upload_artifact_handler(mlflow_client):
 
 
 def test_graphql_handler(mlflow_client):
-    response = requests.request(
-        "post",
+    response = requests.post(
         f"{mlflow_client.tracking_uri}/graphql",
         json={
             "query": 'query testQuery {test(inputString: "abc") { output }}',
@@ -1750,3 +1914,59 @@ def test_graphql_handler(mlflow_client):
         headers={"content-type": "application/json; charset=utf-8"},
     )
     assert response.status_code == 200
+
+
+def test_get_experiment_graphql(mlflow_client):
+    experiment_id = mlflow_client.create_experiment("GraphqlTest")
+    response = requests.post(
+        f"{mlflow_client.tracking_uri}/graphql",
+        json={
+            "query": 'query testQuery {mlflowGetExperiment(input: {experimentId: "'
+            + experiment_id
+            + '"}) { experiment { name } }}',
+            "operationName": "testQuery",
+        },
+        headers={"content-type": "application/json; charset=utf-8"},
+    )
+    assert response.status_code == 200
+    json = response.json()
+    assert json["data"]["mlflowGetExperiment"]["experiment"]["name"] == "GraphqlTest"
+
+
+def test_get_run_and_experiment_graphql(mlflow_client):
+    name = "GraphqlTest"
+    mlflow_client.create_registered_model(name)
+    experiment_id = mlflow_client.create_experiment(name)
+    created_run = mlflow_client.create_run(experiment_id)
+    run_id = created_run.info.run_id
+    mlflow_client.create_model_version("GraphqlTest", "runs:/graphql_test/model", run_id)
+    response = requests.post(
+        f"{mlflow_client.tracking_uri}/graphql",
+        json={
+            "query": f"""
+                query testQuery {{
+                    mlflowGetRun(input: {{runId: "{run_id}"}}) {{
+                        run {{
+                            info {{
+                                status
+                            }}
+                            experiment {{
+                                name
+                            }}
+                            modelVersions {{
+                                name
+                            }}
+                        }}
+                    }}
+                }}
+            """,
+            "operationName": "testQuery",
+        },
+        headers={"content-type": "application/json; charset=utf-8"},
+    )
+    assert response.status_code == 200
+    json = response.json()
+    assert json["errors"] is None
+    assert json["data"]["mlflowGetRun"]["run"]["info"]["status"] == created_run.info.status
+    assert json["data"]["mlflowGetRun"]["run"]["experiment"]["name"] == name
+    assert json["data"]["mlflowGetRun"]["run"]["modelVersions"][0]["name"] == name

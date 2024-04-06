@@ -44,6 +44,11 @@ FLAVOR_NAME = "gluon"
 _MODEL_SAVE_PATH = "net"
 
 
+_MODEL_DATA_PATH = "data"
+
+model_data_artifact_paths = [_MODEL_DATA_PATH]
+
+
 @deprecated(since="2.5.0")
 def load_model(model_uri, ctx, dst_path=None):
     """
@@ -104,7 +109,9 @@ class _GluonModelWrapper:
         self.gluon_model = gluon_model
 
     def predict(
-        self, data, params: Optional[Dict[str, Any]] = None  # pylint: disable=unused-argument
+        self,
+        data,
+        params: Optional[Dict[str, Any]] = None,
     ):
         """This is a docstring. Here is more info.
 
@@ -222,7 +229,7 @@ def save_model(
     _validate_env_arguments(conda_env, pip_requirements, extra_pip_requirements)
     path = os.path.abspath(path)
     _validate_and_prepare_target_save_path(path)
-    data_subpath = "data"
+    data_subpath = _MODEL_DATA_PATH
     data_path = os.path.join(path, data_subpath)
     os.makedirs(data_path)
     code_dir_subpath = _validate_and_copy_code_paths(code_paths, path)
@@ -398,7 +405,7 @@ def autolog(
     disable_for_unsupported_versions=False,
     silent=False,
     registered_model_name=None,
-):  # pylint: disable=unused-argument
+):
     """
     Enables (or disables) and configures autologging from Gluon to MLflow.
     Logs loss and any other metrics specified in the fit
@@ -429,10 +436,10 @@ def autolog(
 
     from mxnet.gluon.contrib.estimator import Estimator
 
-    from mlflow.gluon._autolog import __MLflowGluonCallback
+    from mlflow.gluon._autolog import __MlflowGluonCallback
 
     def getGluonCallback(metrics_logger):
-        return __MLflowGluonCallback(log_models, metrics_logger)
+        return __MlflowGluonCallback(log_models, metrics_logger)
 
     def fit(original, self, *args, **kwargs):
         # Wrap `fit` execution within a batch metrics logger context.
@@ -445,8 +452,6 @@ def autolog(
                 kwargs["event_handlers"] += [mlflowGluonCallback]
             else:
                 kwargs["event_handlers"] = [mlflowGluonCallback]
-            result = original(self, *args, **kwargs)
-
-        return result
+            return original(self, *args, **kwargs)
 
     safe_patch(FLAVOR_NAME, Estimator, "fit", fit, manage_run=True)

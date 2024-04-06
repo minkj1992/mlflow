@@ -1,4 +1,5 @@
 # Define all the service endpoint handlers here.
+import bisect
 import json
 import logging
 import os
@@ -9,6 +10,7 @@ import tempfile
 import time
 import urllib
 from functools import wraps
+from typing import List, Set
 
 import requests
 from flask import Response, current_app, jsonify, request, send_file
@@ -71,6 +73,7 @@ from mlflow.protos.service_pb2 import (
     GetExperiment,
     GetExperimentByName,
     GetMetricHistory,
+    GetMetricHistoryBulkInterval,
     GetRun,
     ListArtifacts,
     LogBatch,
@@ -175,9 +178,10 @@ def _get_artifact_repo_mlflow_artifacts():
 
 def _is_serving_proxied_artifacts():
     """
-    :return: ``True`` if the MLflow server is serving proxied artifacts (i.e. acting as a proxy for
-             artifact upload / download / list operations), as would be enabled by specifying the
-             ``--serve-artifacts`` configuration option. ``False`` otherwise.
+    Returns:
+        True if the MLflow server is serving proxied artifacts (i.e. acting as a proxy for
+        artifact upload / download / list operations), as would be enabled by specifying the
+        --serve-artifacts configuration option. False otherwise.
     """
     from mlflow.server import SERVE_ARTIFACTS_ENV_VAR
 
@@ -195,10 +199,13 @@ def _is_servable_proxied_run_artifact_root(run_artifact_root):
       corresponding to the proxied artifact root, allowing it to fulfill artifact list and
       download requests by using this storage location directly.
 
-    :param run_artifact_root: The Run artifact root location (URI).
-    :return: ``True`` if the specified Run artifact root refers to proxied artifacts that can be
-             served by this MLflow server (i.e. the server has access to the destination and
-             can respond to list and download requests for the artifact). ``False`` otherwise.
+    Args:
+        run_artifact_root: The Run artifact root location (URI).
+
+    Returns:
+        True if the specified Run artifact root refers to proxied artifacts that can be
+        served by this MLflow server (i.e. the server has access to the destination and
+        can respond to list and download requests for the artifact). False otherwise.
     """
     parsed_run_artifact_root = urllib.parse.urlparse(run_artifact_root)
     # NB: If the run artifact root is a proxied artifact root (has scheme `http`, `https`, or
@@ -227,13 +234,16 @@ def _get_proxied_run_artifact_destination_path(proxied_artifact_root, relative_p
     """
     Resolves the specified proxied artifact location within a Run to a concrete storage location.
 
-    :param proxied_artifact_root: The Run artifact root location (URI) with scheme ``http``,
-                                  ``https``, or `mlflow-artifacts` that can be resolved by the
-                                  MLflow server to a concrete storage location.
-    :param relative_path: The relative path of the destination within the specified
-                          ``proxied_artifact_root``. If ``None``, the destination is assumed to be
-                          the resolved ``proxied_artifact_root``.
-    :return: The storage location of the specified artifact.
+    Args:
+        proxied_artifact_root: The Run artifact root location (URI) with scheme ``http``,
+            ``https``, or `mlflow-artifacts` that can be resolved by the MLflow server to a
+            concrete storage location.
+        relative_path: The relative path of the destination within the specified
+            ``proxied_artifact_root``. If ``None``, the destination is assumed to be
+            the resolved ``proxied_artifact_root``.
+
+    Returns:
+        The storage location of the specified artifact.
     """
     parsed_proxied_artifact_root = urllib.parse.urlparse(proxied_artifact_root)
     assert parsed_proxied_artifact_root.scheme in ["http", "https", "mlflow-artifacts"]
@@ -337,8 +347,14 @@ def _assert_required(x):
     assert x != ""
 
 
-def _assert_less_than_or_equal(x, max_value):
-    assert x <= max_value
+def _assert_less_than_or_equal(x, max_value, message=None):
+    if x > max_value:
+        raise AssertionError(message) if message else AssertionError()
+
+
+def _assert_intlike_within_range(x, min_value, max_value, message=None):
+    if not min_value <= x <= max_value:
+        raise AssertionError(message) if message else AssertionError()
 
 
 def _assert_item_type_string(x):
@@ -357,22 +373,20 @@ _TYPE_VALIDATORS = {
 
 def _validate_param_against_schema(schema, param, value, proto_parsing_succeeded=False):
     """
-    Attempts to validate a single parameter against a specified schema.
-    Examples of the elements of the schema are type assertions and checks for required parameters.
-    Returns None on validation success. Otherwise, raises an MLFlowException if an assertion fails.
-    This method is intended to be called for side effects.
+    Attempts to validate a single parameter against a specified schema. Examples of the elements of
+    the schema are type assertions and checks for required parameters. Returns None on validation
+    success.  Otherwise, raises an MLFlowException if an assertion fails. This method is intended
+    to be called for side effects.
 
-            Parameters:
-    :param schema: A list of functions to validate the parameter against.
-    :param param: The string name of the parameter being validated.
-    :param value: The corresponding value of the `param` being validated.
-    :param proto_parsing_succeeded: A boolean value indicating whether proto parsing succeeded.
-                                    If the proto was successfully parsed, we assume all of the types
-                                    of the parameters in the request body were correctly specified,
-                                    and thus we skip validating types. If proto parsing failed,
-                                    then we validate types in addition to the rest of the schema.
-                                    For details, see https://github.com/mlflow/mlflow/pull/
-                                    5458#issuecomment-1080880870.
+    Args:
+        schema: A list of functions to validate the parameter against.
+        param: The string name of the parameter being validated.
+        value: The corresponding value of the `param` being validated.
+        proto_parsing_succeeded: A boolean value indicating whether proto parsing succeeded.
+            If the proto was successfully parsed, we assume all of the types of the parameters in
+            the request body were correctly specified, and thus we skip validating types. If proto
+            parsing failed, then we validate types in addition to the rest of the schema. For
+            details, see https://github.com/mlflow/mlflow/pull/5458#issuecomment-1080880870.
     """
 
     for f in schema:
@@ -381,8 +395,10 @@ def _validate_param_against_schema(schema, param, value, proto_parsing_succeeded
 
         try:
             f(value)
-        except AssertionError:
-            if f == _assert_required:
+        except AssertionError as e:
+            if e.args:
+                message = e.args[0]
+            elif f == _assert_required:
                 message = f"Missing value for required parameter '{param}'."
             else:
                 message = (
@@ -428,21 +444,21 @@ def _get_request_message(request_message, flask_request=request, schema=None):
             ):
                 if not isinstance(request_dict[field.name], list):
                     request_dict[field.name] = [request_dict[field.name]]
-        parse_dict(request_dict, request_message)
-        return request_message
+        request_json = request_dict
 
-    request_json = _get_request_json(flask_request)
+    else:
+        request_json = _get_request_json(flask_request)
 
-    # Older clients may post their JSON double-encoded as strings, so the get_json
-    # above actually converts it to a string. Therefore, we check this condition
-    # (which we can tell for sure because any proper request should be a dictionary),
-    # and decode it a second time.
-    if is_string_type(request_json):
-        request_json = json.loads(request_json)
+        # Older clients may post their JSON double-encoded as strings, so the get_json
+        # above actually converts it to a string. Therefore, we check this condition
+        # (which we can tell for sure because any proper request should be a dictionary),
+        # and decode it a second time.
+        if is_string_type(request_json):
+            request_json = json.loads(request_json)
 
-    # If request doesn't have json body then assume it's empty.
-    if request_json is None:
-        request_json = {}
+        # If request doesn't have json body then assume it's empty.
+        if request_json is None:
+            request_json = {}
 
     proto_parsing_succeeded = True
     try:
@@ -585,9 +601,13 @@ def _create_experiment():
     tags = [ExperimentTag(tag.key, tag.value) for tag in request_message.tags]
 
     # Validate query string in artifact location to prevent attacks
-    parsed_artifact_locaion = urllib.parse.urlparse(request_message.artifact_location)
-    validate_query_string(parsed_artifact_locaion.query)
-
+    parsed_artifact_location = urllib.parse.urlparse(request_message.artifact_location)
+    if parsed_artifact_location.fragment or parsed_artifact_location.params:
+        raise MlflowException(
+            "'artifact_location' URL can't include fragments or params.",
+            error_code=INVALID_PARAMETER_VALUE,
+        )
+    validate_query_string(parsed_artifact_location.query)
     experiment_id = _get_tracking_store().create_experiment(
         request_message.name, request_message.artifact_location, tags
     )
@@ -604,12 +624,17 @@ def _get_experiment():
     request_message = _get_request_message(
         GetExperiment(), schema={"experiment_id": [_assert_required, _assert_string]}
     )
-    response_message = GetExperiment.Response()
-    experiment = _get_tracking_store().get_experiment(request_message.experiment_id).to_proto()
-    response_message.experiment.MergeFrom(experiment)
+    response_message = get_experiment_impl(request_message)
     response = Response(mimetype="application/json")
     response.set_data(message_to_json(response_message))
     return response
+
+
+def get_experiment_impl(request_message):
+    response_message = GetExperiment.Response()
+    experiment = _get_tracking_store().get_experiment(request_message.experiment_id).to_proto()
+    response_message.experiment.MergeFrom(experiment)
+    return response_message
 
 
 @catch_mlflow_exception
@@ -905,7 +930,7 @@ def _search_runs():
         schema={
             "experiment_ids": [_assert_array],
             "filter": [_assert_string],
-            "max_results": [_assert_intlike, lambda x: _assert_less_than_or_equal(x, 50000)],
+            "max_results": [_assert_intlike, lambda x: _assert_less_than_or_equal(int(x), 50000)],
             "order_by": [_assert_array, _assert_item_type_string],
         },
     )
@@ -970,12 +995,13 @@ def _list_artifacts_for_proxied_run_artifact_root(proxied_artifact_root, relativ
     Lists artifacts from the specified ``relative_path`` within the specified proxied Run artifact
     root (i.e. a Run artifact root with scheme ``http``, ``https``, or ``mlflow-artifacts``).
 
-    :param proxied_artifact_root: The Run artifact root location (URI) with scheme ``http``,
-                                  ``https``, or ``mlflow-artifacts`` that can be resolved by the
-                                  MLflow server to a concrete storage location.
-    :param relative_path: The relative path within the specified ``proxied_artifact_root`` under
-                          which to list artifact contents. If ``None``, artifacts are listed from
-                          the ``proxied_artifact_root`` directory.
+    Args:
+        proxied_artifact_root: The Run artifact root location (URI) with scheme ``http``,
+                               ``https``, or ``mlflow-artifacts`` that can be resolved by the
+                               MLflow server to a concrete storage location.
+        relative_path: The relative path within the specified ``proxied_artifact_root`` under
+                       which to list artifact contents. If ``None``, artifacts are listed from
+                       the ``proxied_artifact_root`` directory.
     """
     parsed_proxied_artifact_root = urllib.parse.urlparse(proxied_artifact_root)
     assert parsed_proxied_artifact_root.scheme in ["http", "https", "mlflow-artifacts"]
@@ -1022,7 +1048,7 @@ def _get_metric_history():
 @_disable_if_artifacts_only
 def get_metric_history_bulk_handler():
     MAX_HISTORY_RESULTS = 25000
-    MAX_RUN_IDS_PER_REQUEST = 20
+    MAX_RUN_IDS_PER_REQUEST = 100
     run_ids = request.args.to_dict(flat=False).get("run_id", [])
     if not run_ids:
         raise MlflowException(
@@ -1090,6 +1116,139 @@ def get_metric_history_bulk_handler():
     return {
         "metrics": metrics_with_run_ids[:max_results],
     }
+
+
+def _get_sampled_steps_from_steps(
+    start_step: int, end_step: int, max_results: int, all_steps: List[int]
+) -> Set[int]:
+    # NOTE: all_steps should be sorted before
+    # being passed to this function
+    start_idx = bisect.bisect_left(all_steps, start_step)
+    end_idx = bisect.bisect_right(all_steps, end_step)
+    if end_idx - start_idx <= max_results:
+        return set(all_steps[start_idx:end_idx])
+
+    num_steps = end_idx - start_idx
+    interval = num_steps / max_results
+    sampled_steps = []
+
+    for i in range(0, max_results):
+        idx = start_idx + int(i * interval)
+        if idx < num_steps:
+            sampled_steps.append(all_steps[idx])
+
+    sampled_steps.append(all_steps[end_idx - 1])
+    return set(sampled_steps)
+
+
+@catch_mlflow_exception
+@_disable_if_artifacts_only
+def get_metric_history_bulk_interval_handler():
+    MAX_RUNS_GET_METRIC_HISTORY_BULK = 100
+    MAX_RESULTS_PER_RUN = 2500
+    MAX_RESULTS_GET_METRIC_HISTORY = 25000
+
+    request_message = _get_request_message(
+        GetMetricHistoryBulkInterval(),
+        schema={
+            "run_ids": [
+                _assert_required,
+                _assert_array,
+                _assert_item_type_string,
+                lambda x: _assert_less_than_or_equal(
+                    len(x),
+                    MAX_RUNS_GET_METRIC_HISTORY_BULK,
+                    message=f"GetMetricHistoryBulkInterval request must specify at most "
+                    f"{MAX_RUNS_GET_METRIC_HISTORY_BULK} run_ids. Received {len(x)} run_ids.",
+                ),
+            ],
+            "metric_key": [_assert_required, _assert_string],
+            "start_step": [_assert_intlike],
+            "end_step": [_assert_intlike],
+            "max_results": [
+                _assert_intlike,
+                lambda x: _assert_intlike_within_range(
+                    int(x),
+                    1,
+                    MAX_RESULTS_PER_RUN,
+                    message=f"max_results must be between 1 and {MAX_RESULTS_PER_RUN}.",
+                ),
+            ],
+        },
+    )
+
+    args = request.args
+    run_ids = request_message.run_ids
+    metric_key = request_message.metric_key
+    max_results = int(args.get("max_results", MAX_RESULTS_PER_RUN))
+
+    store = _get_tracking_store()
+
+    def _get_sampled_steps(run_ids, metric_key, max_results):
+        # cannot fetch from request_message as the default value is 0
+        start_step = args.get("start_step")
+        end_step = args.get("end_step")
+
+        # perform validation before any data fetching occurs
+        if start_step is not None and end_step is not None:
+            start_step = int(start_step)
+            end_step = int(end_step)
+            if start_step > end_step:
+                raise MlflowException.invalid_parameter_value(
+                    "end_step must be greater than start_step. "
+                    f"Found start_step={start_step} and end_step={end_step}."
+                )
+        elif start_step is not None or end_step is not None:
+            raise MlflowException.invalid_parameter_value(
+                "If either start step or end step are specified, both must be specified."
+            )
+
+        # get a list of all steps for all runs. this is necessary
+        # because we can't assume that every step was logged, so
+        # sampling needs to be done on the steps that actually exist
+        all_runs = [
+            [m.step for m in store.get_metric_history(run_id, metric_key)] for run_id in run_ids
+        ]
+
+        # save mins and maxes to be added back later
+        all_mins_and_maxes = {step for run in all_runs if run for step in [min(run), max(run)]}
+        all_steps = sorted({step for sublist in all_runs for step in sublist})
+
+        # init start and end step if not provided in args
+        if start_step is None and end_step is None:
+            start_step = 0
+            end_step = all_steps[-1] if all_steps else 0
+
+        # remove any steps outside of the range
+        all_mins_and_maxes = {step for step in all_mins_and_maxes if start_step <= step <= end_step}
+
+        # doing extra iterations here shouldn't badly affect performance,
+        # since the number of steps at this point should be relatively small
+        # (MAX_RESULTS_PER_RUN + len(all_mins_and_maxes))
+        sampled_steps = _get_sampled_steps_from_steps(start_step, end_step, max_results, all_steps)
+        return sorted(sampled_steps.union(all_mins_and_maxes))
+
+    def _default_history_bulk_interval_impl():
+        steps = _get_sampled_steps(run_ids, metric_key, max_results)
+        metrics_with_run_ids = []
+        for run_id in run_ids:
+            metrics_with_run_ids.extend(
+                store.get_metric_history_bulk_interval_from_steps(
+                    run_id=run_id,
+                    metric_key=metric_key,
+                    steps=steps,
+                    max_results=MAX_RESULTS_GET_METRIC_HISTORY,
+                )
+            )
+        return metrics_with_run_ids
+
+    metrics_with_run_ids = _default_history_bulk_interval_impl()
+
+    response_message = GetMetricHistoryBulkInterval.Response()
+    response_message.metrics.extend([m.to_proto() for m in metrics_with_run_ids])
+    response = Response(mimetype="application/json")
+    response.set_data(message_to_json(response_message))
+    return response
 
 
 @catch_mlflow_exception
@@ -1482,7 +1641,7 @@ def _search_registered_models():
         SearchRegisteredModels(),
         schema={
             "filter": [_assert_string],
-            "max_results": [_assert_intlike, lambda x: _assert_less_than_or_equal(x, 1000)],
+            "max_results": [_assert_intlike, lambda x: _assert_less_than_or_equal(int(x), 1000)],
             "order_by": [_assert_array, _assert_item_type_string],
             "page_token": [_assert_string],
         },
@@ -1595,9 +1754,12 @@ def _validate_source(source: str, run_id: str) -> None:
             store = _get_tracking_store()
             run = store.get_run(run_id)
             source = pathlib.Path(local_file_uri_to_path(source)).resolve()
-            run_artifact_dir = pathlib.Path(local_file_uri_to_path(run.info.artifact_uri)).resolve()
-            if run_artifact_dir in [source, *source.parents]:
-                return
+            if is_local_uri(run.info.artifact_uri):
+                run_artifact_dir = pathlib.Path(
+                    local_file_uri_to_path(run.info.artifact_uri)
+                ).resolve()
+                if run_artifact_dir in [source, *source.parents]:
+                    return
 
         raise MlflowException(
             f"Invalid model version source: '{source}'. To use a local path as a model version "
@@ -1760,11 +1922,16 @@ def _search_model_versions():
         SearchModelVersions(),
         schema={
             "filter": [_assert_string],
-            "max_results": [_assert_intlike, lambda x: _assert_less_than_or_equal(x, 200_000)],
+            "max_results": [_assert_intlike, lambda x: _assert_less_than_or_equal(int(x), 200_000)],
             "order_by": [_assert_array, _assert_item_type_string],
             "page_token": [_assert_string],
         },
     )
+    response_message = search_model_versions_impl(request_message)
+    return _wrap_response(response_message)
+
+
+def search_model_versions_impl(request_message):
     store = _get_model_registry_store()
     model_versions = store.search_model_versions(
         filter_string=request_message.filter,
@@ -1776,7 +1943,7 @@ def _search_model_versions():
     response_message.model_versions.extend([e.to_proto() for e in model_versions])
     if model_versions.token:
         response_message.next_page_token = model_versions.token
-    return _wrap_response(response_message)
+    return response_message
 
 
 @catch_mlflow_exception
@@ -2108,8 +2275,8 @@ def _get_paths(base_path):
 
 def get_handler(request_class):
     """
-    :param request_class: The type of protobuf message
-    :return:
+    Args:
+        request_class: The type of protobuf message
     """
     return HANDLERS.get(request_class, _not_implemented)
 
@@ -2127,7 +2294,8 @@ def get_service_endpoints(service, get_handler):
 
 def get_endpoints(get_handler=get_handler):
     """
-    :return: List of tuples (path, handler, methods)
+    Returns:
+        List of tuples (path, handler, methods)
     """
     return (
         get_service_endpoints(MlflowService, get_handler)
@@ -2160,6 +2328,7 @@ HANDLERS = {
     SearchRuns: _search_runs,
     ListArtifacts: _list_artifacts,
     GetMetricHistory: _get_metric_history,
+    GetMetricHistoryBulkInterval: get_metric_history_bulk_interval_handler,
     SearchExperiments: _search_experiments,
     LogInputs: _log_inputs,
     # Model Registry APIs

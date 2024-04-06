@@ -63,7 +63,7 @@ def get_model_class():
 
         def load_context(self, context):
             super().load_context(context)
-            # pylint: disable=attribute-defined-outside-init
+
             self.model = mlflow.sklearn.load_model(model_uri=context.artifacts["sk_model"])
 
         def predict(self, context, model_input, params=None):
@@ -221,7 +221,7 @@ def test_python_model_predict_compatible_without_params(sklearn_knn_model, iris_
 
         def load_context(self, context):
             super().load_context(context)
-            # pylint: disable=attribute-defined-outside-init
+
             self.model = mlflow.sklearn.load_model(model_uri=context.artifacts["sk_model"])
 
         def predict(self, context, model_input):
@@ -1367,7 +1367,7 @@ def test_functional_python_model_unsupported_types(tmp_path):
 
 
 def requires_sklearn(x: List[str]) -> List[str]:
-    import sklearn  # pylint: disable=reimported  # noqa: F401
+    import sklearn  # noqa: F401
 
     return x
 
@@ -1461,7 +1461,8 @@ def test_load_model_fails_for_feature_store_models(tmp_path):
             code_path=[__file__],
         )
     with pytest.raises(
-        MlflowException, match="mlflow.pyfunc.load_model is not supported for Feature Store models"
+        MlflowException,
+        match="Note: mlflow.pyfunc.load_model is not supported for Feature Store models",
     ):
         mlflow.pyfunc.load_model(f"runs:/{run.info.run_id}/model")
 

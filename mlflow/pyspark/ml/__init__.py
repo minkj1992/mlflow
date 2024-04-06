@@ -38,6 +38,7 @@ from mlflow.utils.mlflow_tags import (
     MLFLOW_DATASET_CONTEXT,
     MLFLOW_PARENT_RUN_ID,
 )
+from mlflow.utils.os import is_windows
 from mlflow.utils.rest_utils import (
     MlflowHostCreds,
     augmented_raise_for_status,
@@ -69,7 +70,7 @@ def _read_log_model_allowlist_from_file(allowlist_file):
     url_parsed = urlparse(allowlist_file)
     scheme = url_parsed.scheme
     path = url_parsed.path
-    if os.name == "nt" and not url_parsed.hostname:
+    if is_windows() and not url_parsed.hostname:
         path = scheme + "://" + path
         scheme = ""
     if scheme in ("file", ""):
@@ -97,12 +98,12 @@ def _read_log_model_allowlist():
 
     # New in 3.9: https://docs.python.org/3/library/importlib.resources.html#importlib.resources.files
     if sys.version_info.major > 2 and sys.version_info.minor > 8:
-        from importlib.resources import as_file, files  # pylint: disable=lazy-builtin-import
+        from importlib.resources import as_file, files  # clint: disable=lazy-builtin-import
 
         with as_file(files(__name__).joinpath("log_model_allowlist.txt")) as file:
             builtin_allowlist_file = file.as_posix()
     else:
-        from importlib.resources import path  # pylint: disable=lazy-builtin-import
+        from importlib.resources import path  # clint: disable=lazy-builtin-import
 
         with path(__name__, "log_model_allowlist.txt") as file:
             builtin_allowlist_file = file.as_posix()
@@ -590,12 +591,10 @@ class _AutologgingMetricsManager:
 
     def disable_log_post_training_metrics(self):
         class LogPostTrainingMetricsDisabledScope:
-            def __enter__(inner_self):  # pylint: disable=no-self-argument
-                # pylint: disable=attribute-defined-outside-init
+            def __enter__(inner_self):
                 inner_self.old_status = self._log_post_training_metrics_enabled
                 self._log_post_training_metrics_enabled = False
 
-            # pylint: disable=no-self-argument
             def __exit__(inner_self, exc_type, exc_val, exc_tb):
                 self._log_post_training_metrics_enabled = inner_self.old_status
 
@@ -778,7 +777,7 @@ def autolog(
     log_model_signatures=True,
     log_model_allowlist=None,
     extra_tags=None,
-):  # pylint: disable=unused-argument
+):
     """
     Enables (or disables) and configures autologging for pyspark ml estimators.
     This method is not threadsafe.

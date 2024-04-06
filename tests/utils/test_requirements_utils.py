@@ -10,6 +10,7 @@ import pytest
 import mlflow
 import mlflow.utils.requirements_utils
 from mlflow.utils.environment import infer_pip_requirements
+from mlflow.utils.os import is_windows
 from mlflow.utils.requirements_utils import (
     _capture_imported_modules,
     _get_installed_version,
@@ -141,8 +142,8 @@ line-cont-eof\
     # pip's requirements parser collapses an absolute requirements file path:
     # https://github.com/pypa/pip/issues/10121
     # As a workaround, use a relative path on Windows.
-    absolute_req = abs_req.name if os.name == "nt" else str(abs_req)
-    absolute_con = abs_con.name if os.name == "nt" else str(abs_con)
+    absolute_req = abs_req.name if is_windows() else str(abs_req)
+    absolute_con = abs_con.name if is_windows() else str(abs_con)
     root_req.write_text(
         root_req_src.format(
             relative_req=rel_req.name,
@@ -210,7 +211,7 @@ def test_capture_imported_modules():
     from mlflow.utils._capture_modules import _CaptureImportedModules
 
     with _CaptureImportedModules() as cap:
-        import math  # pylint: disable=lazy-builtin-import  # noqa: F401
+        import math  # clint: disable=lazy-builtin-import  # noqa: F401
 
         __import__("pandas")
         importlib.import_module("numpy")
@@ -292,9 +293,7 @@ def test_infer_requirements_prints_warning_for_unrecognized_packages():
     ), mock.patch(
         "mlflow.utils.requirements_utils._PYPI_PACKAGE_INDEX",
         _PyPIPackageIndex(date="2022-01-01", package_names=set()),
-    ), mock.patch(
-        "mlflow.utils.requirements_utils._logger.warning"
-    ) as mock_warning:
+    ), mock.patch("mlflow.utils.requirements_utils._logger.warning") as mock_warning:
         _infer_requirements("path/to/model", "sklearn")
 
         mock_warning.assert_called_once()
@@ -312,9 +311,7 @@ def test_infer_requirements_does_not_print_warning_for_recognized_packages():
     ), mock.patch(
         "mlflow.utils.requirements_utils._PYPI_PACKAGE_INDEX",
         _PyPIPackageIndex(date="2022-01-01", package_names={"scikit-learn"}),
-    ), mock.patch(
-        "mlflow.utils.requirements_utils._logger.warning"
-    ) as mock_warning:
+    ), mock.patch("mlflow.utils.requirements_utils._logger.warning") as mock_warning:
         _infer_requirements("path/to/model", "sklearn")
         mock_warning.assert_not_called()
 
@@ -579,7 +576,5 @@ Detected one or more mismatches between the model's dependencies and the current
  - cloudpickle (current: 999.99.22, required: cloudpickle=={cloudpickle_version})
 To fix the mismatches, call `mlflow.pyfunc.get_model_dependencies(model_uri)` to fetch the \
 model's environment and install dependencies using the resulting environment file.
-""".strip().format(
-                    cloudpickle_version=cloudpickle.__version__
-                )
+""".strip().format(cloudpickle_version=cloudpickle.__version__)
             )

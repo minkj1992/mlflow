@@ -91,11 +91,36 @@ def test_logged_data_structure(model_path, basic_model):
     ) == expected_requirements
 
     mlmodel = yaml.safe_load(model_path.joinpath("MLmodel").read_bytes())
-    assert mlmodel["flavors"]["python_function"]["loader_module"] == "mlflow.sentence_transformers"
-    assert (
-        mlmodel["flavors"]["python_function"]["data"]
-        == mlflow.sentence_transformers.SENTENCE_TRANSFORMERS_DATA_PATH
-    )
+    assert "model_size_bytes" in mlmodel
+
+    pyfunc_flavor = mlmodel["flavors"]["python_function"]
+    assert pyfunc_flavor["loader_module"] == "mlflow.sentence_transformers"
+    assert pyfunc_flavor["data"] == mlflow.sentence_transformers.SENTENCE_TRANSFORMERS_DATA_PATH
+
+    st_flavor = mlmodel["flavors"]["sentence_transformers"]
+    assert st_flavor["pipeline_model_type"] == "BertModel"
+    assert st_flavor["source_model_name"] == "sentence-transformers/all-MiniLM-L6-v2"
+
+
+@pytest.mark.parametrize(
+    ("model_name", "expected"),
+    [
+        (
+            "sentence-transformers/all-MiniLM-L6-v2",
+            "sentence-transformers/all-MiniLM-L6-v2",
+        ),
+        (
+            "/path./to_/local-/path?/sentence-transformers_all-MiniLM-L6-v2/",
+            "sentence-transformers/all-MiniLM-L6-v2",
+        ),
+        (
+            "/path/to/local/path/custom-user-009_model_name_with_underscore/",
+            "custom-user-009/model_name_with_underscore",
+        ),
+    ],
+)
+def test_get_transformers_model_name(model_name, expected):
+    assert mlflow.sentence_transformers._get_transformers_model_name(model_name) == expected
 
 
 def test_model_logging_and_inference(basic_model):
@@ -480,3 +505,51 @@ def test_model_log_with_signature_inference(basic_model):
 
     model_info = Model.load(model_uri)
     assert model_info.signature == SIGNATURE
+
+
+def test_verify_task_and_update_metadata():
+    # Update embedding task with empty metadata
+    metadata = mlflow.sentence_transformers._verify_task_and_update_metadata("llm/v1/embeddings")
+    assert metadata == {"task": "llm/v1/embeddings"}
+    # Update embedding task with metadata containing task
+    metadata = mlflow.sentence_transformers._verify_task_and_update_metadata(
+        "llm/v1/embeddings", metadata
+    )
+    assert metadata == {"task": "llm/v1/embeddings"}
+
+    # Update embedding task with metadata containing different task
+    metadata = {"task": "llm/v1/completions"}
+    with pytest.raises(
+        MlflowException, match=r"Task type is inconsistent with the task value from metadata"
+    ):
+        mlflow.sentence_transformers._verify_task_and_update_metadata("llm/v1/embeddings", metadata)
+
+    # Invalid task type
+    with pytest.raises(MlflowException, match=r"Task type could only be llm/v1/embeddings"):
+        mlflow.sentence_transformers._verify_task_and_update_metadata("llm/v1/completions")
+
+
+def test_model_pyfunc_with_dict_input(basic_model, model_path):
+    mlflow.sentence_transformers.save_model(basic_model, model_path, task="llm/v1/embeddings")
+    loaded_pyfunc = pyfunc.load_model(model_uri=model_path)
+
+    sentence = "hello world and hello mlflow"
+    sentences = [sentence, "goodbye my friends", "i am a sentence"]
+    embedding_dim = basic_model.get_sentence_embedding_dimension()
+
+    single_input = {"input": sentence}
+    emb_single_input = loaded_pyfunc.predict(single_input)
+
+    assert isinstance(emb_single_input, dict)
+    assert len(emb_single_input["data"]) == 1
+    assert isinstance(emb_single_input["data"][0], dict)
+    assert emb_single_input["data"][0]["embedding"].shape == (embedding_dim,)
+    assert emb_single_input["usage"]["prompt_tokens"] == 8
+
+    multiple_input = {"input": sentences}
+    emb_multiple_input = loaded_pyfunc.predict(multiple_input)
+
+    assert isinstance(emb_multiple_input, dict)
+    assert len(emb_multiple_input["data"]) == 3
+    assert emb_multiple_input["data"][0]["embedding"].shape == (embedding_dim,)
+    assert emb_multiple_input["usage"]["prompt_tokens"] == 19

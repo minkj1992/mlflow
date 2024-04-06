@@ -6,6 +6,7 @@ import posixpath
 import random
 import re
 from collections import namedtuple
+from datetime import datetime, timezone
 from unittest import mock
 
 import pytest
@@ -736,8 +737,8 @@ def _assert_get_artifact_uri_appends_to_uri_path_component_correctly(
             "mysql://user:password@host:port/dbname/{run_id}/artifacts/{path}?driver=mydriver",
         ),
         (
-            "mysql+driver://user:password@host:port/dbname/subpath/#fragment",
-            "mysql+driver://user:password@host:port/dbname/subpath/{run_id}/artifacts/{path}#fragment",  # pylint: disable=line-too-long
+            "mysql+driver://user:pass@host:port/dbname/subpath/#fragment",
+            "mysql+driver://user:pass@host:port/dbname/subpath/{run_id}/artifacts/{path}#fragment",
         ),
         ("s3://bucketname/rootpath", "s3://bucketname/rootpath/{run_id}/artifacts/{path}"),
     ],
@@ -1050,3 +1051,161 @@ def test_load_table():
     # test 7: load table with no matching extra_column found. Error case
     with pytest.raises(KeyError, match="error_column"):
         mlflow.load_table(artifact_file=artifact_file, extra_columns=["error_column"])
+
+
+@pytest.mark.skipif(
+    "MLFLOW_SKINNY" in os.environ,
+    reason="Skinny client does not support the np or pandas dependencies",
+)
+def test_log_table_with_datetime_columns():
+    import pandas as pd
+
+    start_time = str(datetime.now(timezone.utc))
+    table_dict = {
+        "inputs": ["What is MLflow?", "What is Databricks?"],
+        "outputs": ["MLflow is ...", "Databricks is ..."],
+        "start_time": [start_time, start_time],
+    }
+    artifact_file = "test_time.json"
+
+    with mlflow.start_run() as run:
+        # Log the dictionary as a table
+        mlflow.log_table(data=table_dict, artifact_file=artifact_file)
+        run_id = run.info.run_id
+
+    artifact_path = mlflow.artifacts.download_artifacts(run_id=run_id, artifact_path=artifact_file)
+    table_data = pd.read_json(artifact_path, orient="split", convert_dates=False)
+    assert table_data["start_time"][0] == start_time
+
+    # append the same table to the same artifact file
+    mlflow.log_table(data=table_dict, artifact_file=artifact_file, run_id=run_id)
+    artifact_path = mlflow.artifacts.download_artifacts(run_id=run_id, artifact_path=artifact_file)
+    df = pd.read_json(artifact_path, orient="split", convert_dates=False)
+    assert df["start_time"][2] == start_time
+
+
+@pytest.mark.skipif(
+    "MLFLOW_SKINNY" in os.environ,
+    reason="Skinny client does not support the np or pandas dependencies",
+)
+def test_log_table_with_image_columns():
+    import numpy as np
+    import pandas as pd
+    from PIL import Image
+
+    image = mlflow.Image([[1, 2, 3]])
+    table_dict = {
+        "inputs": ["What is MLflow?", "What is Databricks?"],
+        "outputs": ["MLflow is ...", "Databricks is ..."],
+        "image": [image, image],
+    }
+    artifact_file = "test_time.json"
+
+    with mlflow.start_run() as run:
+        # Log the dictionary as a table
+        mlflow.log_table(data=table_dict, artifact_file=artifact_file)
+        run_id = run.info.run_id
+
+    artifact_path = mlflow.artifacts.download_artifacts(run_id=run_id, artifact_path=artifact_file)
+    table_data = pd.read_json(artifact_path, orient="split")
+    assert table_data["image"][0]["type"] == "image"
+    image_path = mlflow.artifacts.download_artifacts(
+        run_id=run_id, artifact_path=table_data["image"][0]["filepath"]
+    )
+    image2 = Image.open(image_path)
+    assert np.abs(image.to_array() - np.array(image2)).sum() == 0
+
+    # append the same table to the same artifact file
+    mlflow.log_table(data=table_dict, artifact_file=artifact_file, run_id=run_id)
+    artifact_path = mlflow.artifacts.download_artifacts(run_id=run_id, artifact_path=artifact_file)
+    df = pd.read_json(artifact_path, orient="split")
+    assert df["image"][2]["type"] == "image"
+
+
+@pytest.mark.skipif(
+    "MLFLOW_SKINNY" in os.environ,
+    reason="Skinny client does not support the np or pandas dependencies",
+)
+def test_log_table_with_pil_image_columns():
+    import numpy as np
+    import pandas as pd
+    from PIL import Image
+
+    image = Image.fromarray(np.array([[1.0, 2.0, 3.0]]))
+    image = image.convert("RGB")
+
+    table_dict = {
+        "inputs": ["What is MLflow?", "What is Databricks?"],
+        "outputs": ["MLflow is ...", "Databricks is ..."],
+        "image": [image, image],
+    }
+    artifact_file = "test_time.json"
+
+    with mlflow.start_run() as run:
+        # Log the dictionary as a table
+        mlflow.log_table(data=table_dict, artifact_file=artifact_file)
+        run_id = run.info.run_id
+
+    artifact_path = mlflow.artifacts.download_artifacts(run_id=run_id, artifact_path=artifact_file)
+    table_data = pd.read_json(artifact_path, orient="split")
+    assert table_data["image"][0]["type"] == "image"
+    image_path = mlflow.artifacts.download_artifacts(
+        run_id=run_id, artifact_path=table_data["image"][0]["filepath"]
+    )
+    image2 = Image.open(image_path)
+    assert np.abs(np.array(image) - np.array(image2)).sum() == 0
+
+    # append the same table to the same artifact file
+    mlflow.log_table(data=table_dict, artifact_file=artifact_file, run_id=run_id)
+    artifact_path = mlflow.artifacts.download_artifacts(run_id=run_id, artifact_path=artifact_file)
+    df = pd.read_json(artifact_path, orient="split")
+    assert df["image"][2]["type"] == "image"
+
+
+@pytest.mark.skipif(
+    "MLFLOW_SKINNY" in os.environ,
+    reason="Skinny client does not support the np or pandas dependencies",
+)
+def test_log_table_with_invalid_image_columns():
+    image = mlflow.Image([[1, 2, 3]])
+    table_dict = {
+        "inputs": ["What is MLflow?", "What is Databricks?"],
+        "outputs": ["MLflow is ...", "Databricks is ..."],
+        "image": [image, "text"],
+    }
+    artifact_file = "test_time.json"
+    with pytest.raises(ValueError, match="Column `image` contains a mix of images and non-images"):
+        with mlflow.start_run():
+            # Log the dictionary as a table
+            mlflow.log_table(data=table_dict, artifact_file=artifact_file)
+
+
+@pytest.mark.skipif(
+    "MLFLOW_SKINNY" in os.environ,
+    reason="Skinny client does not support the np or pandas dependencies",
+)
+def test_log_table_with_valid_image_columns():
+    class ImageObj:
+        def __init__(self):
+            self.size = (1, 1)
+
+        def resize(self, size):
+            return self
+
+        def save(self, path):
+            with open(path, "w+") as f:
+                f.write("dummy data")
+
+    image_obj = ImageObj()
+    image = mlflow.Image([[1, 2, 3]])
+
+    table_dict = {
+        "inputs": ["What is MLflow?", "What is Databricks?"],
+        "outputs": ["MLflow is ...", "Databricks is ..."],
+        "image": [image, image_obj],
+    }
+    # No error should be raised
+    artifact_file = "test_time.json"
+    with mlflow.start_run():
+        # Log the dictionary as a table
+        mlflow.log_table(data=table_dict, artifact_file=artifact_file)

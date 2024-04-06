@@ -74,7 +74,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           changed_files="$(gh pr view --repo ${{ github.repository }} ${{ needs.check-comment.outputs.pull_number }} --json files --jq '.files.[].path')"
-          protos=$([[ -z $(echo "$changed_files" | grep '^mlflow/protos') ]] && echo "false" || echo "true")
+          protos=$([[ -z $(echo "$changed_files" | grep '^\(mlflow/protos\|tests/protos\)') ]] && echo "false" || echo "true")
           python=$([[ -z $(echo "$changed_files" | grep '\.py$\|^pyproject\.toml$') ]] && echo "false" || echo "true")
           js=$([[ -z $(echo "$changed_files" | grep '^mlflow/server/js') ]] && echo "false" || echo "true")
           r=$([[ -z $(echo "$changed_files" | grep '^mlflow/R/mlflow') ]] && echo "false" || echo "true")
@@ -93,6 +93,8 @@ jobs:
       - uses: ./.github/actions/setup-python
       - run: |
           pip install -r requirements/lint-requirements.txt
+          # TODO: Use a precompiled binary once it's available: https://github.com/tamasfe/taplo/issues/542
+          cargo install taplo-cli@0.9.0 --locked
           pre-commit install
       # ************************************************************************
       # Prettier
@@ -106,18 +108,24 @@ jobs:
         env:
           DOCKER_BUILDKIT: 1
         run: |
-          docker build -t gen-protos -f dev/Dockerfile.protos .
+          wget https://github.com/protocolbuffers/protobuf/releases/download/v3.19.4/protoc-3.19.4-linux-x86_64.zip -O /tmp/protoc.zip
+          sudo unzip /tmp/protoc.zip -d /tmp/protoc
+          sudo chmod -R 777 /tmp/protoc
+          echo "/tmp/protoc/bin" >> $GITHUB_PATH
+          pip install --upgrade pip
+          pip install .
       - if: steps.diff.outputs.protos == 'true'
         run: |
-          docker run --rm -w /mlflow -v $(pwd):/mlflow gen-protos ./dev/generate-protos.sh
+          ./dev/generate-protos.sh
       # ************************************************************************
       # python
       # ************************************************************************
       - if: steps.diff.outputs.python == 'true'
         run: |
-          ruff --fix .
-          black .
-          blacken-docs $(git ls-files '*.py' '*.rst' '*.md') || true
+          ruff check --fix .
+          ruff format .
+          taplo format $(git ls-files '*.toml')
+          blacken-docs $(git ls-files '*.rst' '*.md') || true
       # ************************************************************************
       # js
       # ************************************************************************
@@ -133,6 +141,7 @@ jobs:
         working-directory: mlflow/server/js
         run: |
           yarn lint:fix
+          yarn prettier:fix
       - if: steps.diff.outputs.js == 'true'
         working-directory: mlflow/server/js
         run: |
@@ -155,7 +164,7 @@ jobs:
           echo "reformatted=$reformatted" >> $GITHUB_OUTPUT
 
       - name: Upload patch
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ github.run_id }}.diff
           path: ${{ github.run_id }}.diff
@@ -183,7 +192,7 @@ jobs:
           git merge base/${{ needs.check-comment.outputs.base_ref }}
 
       - name: Download patch
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: ${{ github.run_id }}.diff
           path: /tmp

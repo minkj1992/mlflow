@@ -23,6 +23,7 @@ from mlflow.exceptions import MlflowException
 from mlflow.server import handlers
 from mlflow.store.tracking.file_store import FileStore
 from mlflow.store.tracking.sqlalchemy_store import SqlAlchemyStore
+from mlflow.utils.os import is_windows
 from mlflow.utils.rest_utils import augmented_raise_for_status
 from mlflow.utils.time import get_current_time_millis
 
@@ -390,9 +391,7 @@ def test_mlflow_gc_experiments(get_store_details, request):
         # https://github.com/SeldonIO/MLServer/issues/361
         pytest.param(
             True,
-            marks=pytest.mark.skipif(
-                os.name == "nt", reason="MLServer is not supported in Windows"
-            ),
+            marks=pytest.mark.skipif(is_windows(), reason="MLServer is not supported in Windows"),
         ),
         False,
     ],
@@ -412,8 +411,8 @@ def test_mlflow_models_serve(enable_mlserver):
                 artifact_path="model",
                 python_model=model,
                 extra_pip_requirements=[
-                    "mlserver>=1.2.0,!=1.3.1",
-                    "mlserver-mlflow>=1.2.0,!=1.3.1",
+                    "mlserver>=1.2.0,!=1.3.1,<1.4.0",
+                    "mlserver-mlflow>=1.2.0,!=1.3.1,<1.4.0",
                     PROTOBUF_REQUIREMENT,
                 ],
             )
